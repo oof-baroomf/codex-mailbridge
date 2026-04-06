@@ -67,6 +67,20 @@ def test_build_shell_command_streams_to_tmux_and_log() -> None:
     assert EXIT_SENTINEL_PREFIX in command
 
 
+def test_build_tui_command_resumes_non_interactive_session_inline() -> None:
+    manager = CodexExecManager(_config())
+
+    command = manager._build_tui_command(
+        workspace=Path("/tmp/work"),
+        session_id="session-123",
+    )
+
+    assert command.startswith(f"{manager.codex_bin} resume")
+    assert "--include-non-interactive" in command
+    assert "--no-alt-screen" in command
+    assert "session-123" in command
+
+
 def test_read_turn_state_parses_progress_completion_and_exit_code(tmp_path: Path) -> None:
     log_path = tmp_path / "turn.jsonl"
     log_path.write_text(

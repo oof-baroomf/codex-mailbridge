@@ -143,3 +143,17 @@ def test_session_path_for_id_uses_filename_match(tmp_path: Path, monkeypatch) ->
 
 def test_module_uses_default_session_root() -> None:
     assert CODEX_SESSION_DIR == Path.home() / ".codex" / "sessions"
+
+
+def test_pane_text_indicates_ready_for_resumed_prompt() -> None:
+    manager = CodexExecManager(_config())
+
+    pane_text = """
+  previous output
+
+› Explain this codebase
+
+  gpt-5.4 high · ~/coding/cad-bench · Context [     ] · weekly 68%
+"""
+
+    assert manager._pane_text_indicates_ready(pane_text) is True

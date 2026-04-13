@@ -9,6 +9,7 @@ class _FakeExec:
         self.started: list[dict] = []
         self.state = ExecTurnState()
         self.live_panes: set[str] = set()
+        self.killed_sessions: list[str] = []
 
     def interrupt_turn(self, pane_id: str) -> None:
         self.interrupted.append(pane_id)
@@ -28,6 +29,9 @@ class _FakeExec:
 
     def pane_running_codex(self, pane_id: str) -> bool:
         return pane_id in self.live_panes
+
+    def kill_agent_session(self, agent_id: str) -> None:
+        self.killed_sessions.append(agent_id)
 
 class _FakeGmail:
     def __init__(self) -> None:
@@ -86,6 +90,68 @@ def test_supersede_pending_turns_interrupts_running_and_deletes_only_queued() ->
 
     assert daemon.exec.interrupted == ["%2"]
     assert daemon.db.deleted == [1]
+
+
+class _EndDB:
+    def __init__(self) -> None:
+        self.deleted: list[int] = []
+        self.finished: list[tuple[int, str | None]] = []
+        self.updated_email: list[tuple[str, str]] = []
+        self.thread = type(
+            "Thread",
+            (),
+            {
+                "agent_id": "agent-1",
+                "codex_thread_id": "session-123",
+                "gmail_thread_id": "g1",
+                "workspace_path": "/tmp/work",
+                "canonical_subject": "subject",
+                "last_email_message_id": "<last@msg>",
+            },
+        )()
+
+    def get_thread_by_agent(self, agent_id: str):
+        return self.thread
+
+    def pending_turns_for_agent(self, agent_id: str):
+        return [
+            PendingTurn(
+                id=1,
+                agent_id=agent_id,
+                gmail_message_id="m1",
+                reply_to_message_id=None,
+                text_body="old",
+                image_paths=[],
+                attachment_paths=[],
+                status="queued",
+                codex_turn_id="pending:1",
+                runner_pane_id=None,
+                runner_log_path=None,
+            ),
+            PendingTurn(
+                id=2,
+                agent_id=agent_id,
+                gmail_message_id="m2",
+                reply_to_message_id=None,
+                text_body="running",
+                image_paths=[],
+                attachment_paths=[],
+                status="running",
+                codex_turn_id="turn-2",
+                runner_pane_id="%2",
+                runner_log_path="/tmp/2.jsonl",
+            ),
+        ]
+
+    def delete_pending_turns(self, pending_turn_ids: list[int]) -> None:
+        self.deleted = pending_turn_ids
+
+    def mark_turn_finished(self, pending_turn_id: int, error: str | None = None) -> None:
+        self.finished.append((pending_turn_id, error))
+
+    def update_last_email_message_id(self, agent_id: str, message_id: str) -> None:
+        self.updated_email.append((agent_id, message_id))
+        self.thread.last_email_message_id = message_id
 
 
 class _StartDB:
@@ -280,6 +346,28 @@ def test_sync_pending_turn_marks_missing_codex_process_as_failure() -> None:
         {
             "subject": "Re: subject",
             "markdown_body": "Codex error:\n\nCodex exited without a final status.",
+            "parent_message_id": "<reply@msg>",
+            "references": ["<last@msg>"],
+        }
+    ]
+
+
+def test_handle_end_command_interrupts_running_turns_kills_session_and_acks() -> None:
+    daemon = object.__new__(MailBridgeDaemon)
+    daemon.db = _EndDB()
+    daemon.gmail = _FakeGmail()
+    daemon.exec = _FakeExec()
+
+    daemon._handle_end_command(daemon.db.thread, "<reply@msg>")
+
+    assert daemon.exec.interrupted == ["%2"]
+    assert daemon.exec.killed_sessions == ["agent-1"]
+    assert daemon.db.deleted == [1]
+    assert daemon.db.finished == [(2, "Ended by email command.")]
+    assert daemon.gmail.calls == [
+        {
+            "subject": "Re: subject",
+            "markdown_body": "Ended. The tmux session was stopped. Reply again on this thread to resume the same Codex session.",
             "parent_message_id": "<reply@msg>",
             "references": ["<last@msg>"],
         }

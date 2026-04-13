@@ -90,6 +90,10 @@ def _format_turn_failure(error_text: str) -> str:
     return f"Codex error:\n\n{error_text.strip()}"
 
 
+def _is_end_command(body_text: str) -> bool:
+    return body_text.strip().lower() == "end"
+
+
 def _session_id_for_thread(thread: ThreadRecord) -> str | None:
     if thread.codex_thread_id.startswith("local:"):
         return None
@@ -156,6 +160,16 @@ class MailBridgeDaemon:
         self.db.record_turn_email(self._turn_key(pending), "assistant_progress", email_id)
         self.db.update_last_email_message_id(current_thread.agent_id, email_id)
 
+    def _send_thread_reply(self, thread: ThreadRecord, parent_message_id: str | None, body: str) -> None:
+        current_thread = self._fresh_thread(thread)
+        email_id = self.gmail.send_assistant_reply(
+            subject=_reply_subject(current_thread.canonical_subject),
+            markdown_body=body,
+            parent_message_id=parent_message_id or current_thread.last_email_message_id,
+            references=[current_thread.last_email_message_id] if current_thread.last_email_message_id else [],
+        )
+        self.db.update_last_email_message_id(current_thread.agent_id, email_id)
+
     def _fail_pending_turn(self, thread: ThreadRecord, pending: PendingTurn, error_text: str) -> None:
         self.db.mark_turn_finished(pending.id, error_text)
         if not self.db.turn_email_exists(self._turn_key(pending), "assistant_reply"):
@@ -209,6 +223,9 @@ class MailBridgeDaemon:
         else:
             workspace = Path(thread.workspace_path)
             if body_text.strip():
+                if _is_end_command(body_text):
+                    self._handle_end_command(thread, msg.rfc_message_id)
+                    return
                 self._supersede_pending_turns(thread)
 
         attachment_paths, image_paths = save_attachments(workspace, msg.attachments)
@@ -222,6 +239,23 @@ class MailBridgeDaemon:
             text_body=body_text,
             image_paths=image_paths,
             attachment_paths=attachment_paths,
+        )
+
+    def _handle_end_command(self, thread: ThreadRecord, reply_to_message_id: str | None) -> None:
+        queued_ids: list[int] = []
+        for pending in self.db.pending_turns_for_agent(thread.agent_id):
+            if pending.status == "queued":
+                queued_ids.append(pending.id)
+                continue
+            if pending.runner_pane_id:
+                self.exec.interrupt_turn(pending.runner_pane_id)
+            self.db.mark_turn_finished(pending.id, "Ended by email command.")
+        self.db.delete_pending_turns(queued_ids)
+        self.exec.kill_agent_session(thread.agent_id)
+        self._send_thread_reply(
+            thread,
+            reply_to_message_id,
+            "Ended. The tmux session was stopped. Reply again on this thread to resume the same Codex session.",
         )
 
     def _create_thread(

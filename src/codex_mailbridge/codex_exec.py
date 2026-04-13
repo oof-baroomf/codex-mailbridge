@@ -158,6 +158,10 @@ class CodexExecManager:
     def interrupt_turn(self, pane_id: str) -> None:
         subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-c"], check=False)
 
+    def kill_agent_session(self, agent_id: str) -> None:
+        session_name = self._session_name(agent_id)
+        subprocess.run(["tmux", "kill-session", "-t", session_name], check=False)
+
     def pane_exists(self, pane_id: str) -> bool:
         result = subprocess.run(
             ["tmux", "display-message", "-p", "-t", pane_id, "#{pane_id}"],
@@ -324,7 +328,7 @@ class CodexExecManager:
                 subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-m"], check=False)
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
-            if "OpenAI Codex" in pane_text:
+            if self._pane_text_indicates_ready(pane_text):
                 return
             if not self.pane_exists(pane_id):
                 raise RuntimeError("Codex pane exited before the TUI became ready.")
@@ -439,6 +443,15 @@ class CodexExecManager:
             check=False,
         )
         return result.stdout
+
+    def _pane_text_indicates_ready(self, pane_text: str) -> bool:
+        if "OpenAI Codex" in pane_text:
+            return True
+        for line in pane_text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("› "):
+                return True
+        return False
 
     def _window_name(self, agent_id: str, pending_turn_id: int) -> str:
         sanitized = re.sub(r"[^A-Za-z0-9_-]+", "-", agent_id).strip("-") or "agent"

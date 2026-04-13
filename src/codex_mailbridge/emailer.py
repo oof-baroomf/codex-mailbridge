@@ -28,6 +28,8 @@ from .config import Config
 
 LOG = logging.getLogger(__name__)
 MAIL_SCOPE = ["https://mail.google.com/"]
+IMAP_TIMEOUT_SECONDS = 30
+_GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
 
 
 class _HTMLStripper(HTMLParser):
@@ -48,6 +50,21 @@ def _xoauth2(user: str, access_token: str) -> bytes:
 
 def _xoauth2_b64(user: str, access_token: str) -> str:
     return base64.b64encode(_xoauth2(user, access_token)).decode("ascii")
+
+
+def canonical_email_address(address: str) -> str:
+    mailbox = parseaddr(address)[1].strip().lower()
+    if not mailbox or "@" not in mailbox:
+        return mailbox
+    local, domain = mailbox.split("@", 1)
+    if domain in _GMAIL_DOMAINS:
+        local = local.split("+", 1)[0].replace(".", "")
+        domain = "gmail.com"
+    return f"{local}@{domain}"
+
+
+def email_addresses_match(left: str, right: str) -> bool:
+    return canonical_email_address(left) == canonical_email_address(right)
 
 
 class GmailAuth:
@@ -179,7 +196,11 @@ class GmailClient:
         self.auth = GmailAuth(config)
 
     def _open_imap(self) -> imaplib.IMAP4_SSL:
-        imap = imaplib.IMAP4_SSL(self.config.gmail.imap_host, self.config.gmail.imap_port)
+        imap = imaplib.IMAP4_SSL(
+            self.config.gmail.imap_host,
+            self.config.gmail.imap_port,
+            timeout=IMAP_TIMEOUT_SECONDS,
+        )
         self.auth.imap_login(imap)
         imap.select("INBOX")
         return imap

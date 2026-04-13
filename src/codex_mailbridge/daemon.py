@@ -10,7 +10,7 @@ import time
 from .codex_exec import CodexExecManager
 from .config import Config
 from .db import PendingTurn, StateDB, ThreadRecord
-from .emailer import GmailClient, IncomingMail, save_attachments
+from .emailer import GmailClient, IncomingMail, email_addresses_match, save_attachments
 
 
 LOG = logging.getLogger(__name__)
@@ -174,7 +174,7 @@ class MailBridgeDaemon:
             LOG.exception("Inbox poll failed")
             return
         for msg in messages:
-            if msg.from_address != self.config.gmail.allowed_from.lower():
+            if not email_addresses_match(msg.from_address, self.config.gmail.allowed_from):
                 continue
             if self.db.message_processed(msg.gmail_message_id):
                 self.gmail.mark_seen(msg.uid)

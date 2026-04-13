@@ -1,7 +1,15 @@
 import base64
 from pathlib import Path
+from types import SimpleNamespace
 
-from codex_mailbridge.emailer import _xoauth2, _xoauth2_b64, save_attachments
+from codex_mailbridge.emailer import (
+    GmailClient,
+    _xoauth2,
+    _xoauth2_b64,
+    canonical_email_address,
+    email_addresses_match,
+    save_attachments,
+)
 
 
 def test_xoauth2_imap_payload_is_raw_bytes() -> None:
@@ -12,6 +20,36 @@ def test_xoauth2_imap_payload_is_raw_bytes() -> None:
 def test_xoauth2_smtp_payload_is_base64_encoded() -> None:
     encoded = _xoauth2_b64("user@example.com", "token123")
     assert base64.b64decode(encoded) == b"user=user@example.com\x01auth=Bearer token123\x01\x01"
+
+
+def test_canonical_email_address_normalizes_gmail_aliases() -> None:
+    assert canonical_email_address("Dhruv.Saini+canned.response@googlemail.com") == "dhruvsaini@gmail.com"
+
+
+def test_email_addresses_match_accepts_gmail_plus_aliases() -> None:
+    assert email_addresses_match("dhruv9saini+canned.response@gmail.com", "dhruv9saini@gmail.com")
+
+
+def test_open_imap_sets_timeout(monkeypatch) -> None:
+    calls: list[tuple[str, int, int | None]] = []
+
+    class _FakeImap:
+        def select(self, mailbox: str) -> None:
+            assert mailbox == "INBOX"
+
+    def _fake_imap(host: str, port: int, *, timeout: int | None = None):
+        calls.append((host, port, timeout))
+        return _FakeImap()
+
+    client = object.__new__(GmailClient)
+    client.config = SimpleNamespace(gmail=SimpleNamespace(imap_host="imap.example.com", imap_port=993))
+    client.auth = SimpleNamespace(imap_login=lambda imap: None)
+
+    monkeypatch.setattr("codex_mailbridge.emailer.imaplib.IMAP4_SSL", _fake_imap)
+
+    client._open_imap()
+
+    assert calls == [("imap.example.com", 993, 30)]
 
 
 def test_save_attachments_uses_default_attachment_names(tmp_path: Path) -> None:

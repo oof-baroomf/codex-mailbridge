@@ -276,8 +276,11 @@ class MailBridgeDaemon:
                 LOG.exception("Failed to start queued turn for %s", thread.agent_id)
                 self._fail_pending_turn(thread, pending, str(exc))
                 continue
+            if started.thread_id and started.thread_id != thread.codex_thread_id:
+                self.db.update_thread_codex_id(thread.agent_id, started.thread_id)
             self.db.mark_turn_running(
                 pending.id,
+                codex_turn_id=started.turn_id,
                 runner_pane_id=started.pane_id,
                 runner_log_path=started.log_path,
             )
@@ -290,7 +293,7 @@ class MailBridgeDaemon:
                 self._sync_pending_turn(thread, pending)
 
     def _sync_pending_turn(self, thread: ThreadRecord, pending: PendingTurn) -> None:
-        state = self.exec.read_turn_state(pending.runner_log_path)
+        state = self.exec.read_turn_state(pending.runner_log_path, pending.codex_turn_id)
         if state.thread_id and state.thread_id != thread.codex_thread_id:
             self.db.update_thread_codex_id(thread.agent_id, state.thread_id)
             thread = self._fresh_thread(thread)
@@ -309,6 +312,13 @@ class MailBridgeDaemon:
             error_text = state.failure_text()
             self.db.mark_turn_finished(pending.id, error_text)
             if not state.interrupted and not self.db.turn_email_exists(turn_key, "assistant_reply"):
+                self._send_turn_reply(thread, pending, _format_turn_failure(error_text))
+            return
+
+        if pending.runner_pane_id and not self.exec.pane_running_codex(pending.runner_pane_id):
+            error_text = "Codex exited without a final status."
+            self.db.mark_turn_finished(pending.id, error_text)
+            if not self.db.turn_email_exists(turn_key, "assistant_reply"):
                 self._send_turn_reply(thread, pending, _format_turn_failure(error_text))
             return
 

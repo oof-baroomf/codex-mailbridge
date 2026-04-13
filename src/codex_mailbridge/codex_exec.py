@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 
 from .config import Config
 
@@ -15,13 +16,21 @@ from .config import Config
 LOG = logging.getLogger(__name__)
 DEFAULT_CODEX_BIN = "/home/d/.bun/bin/codex"
 TMUX_SESSION_PREFIX = "codex-mailbridge"
-EXIT_SENTINEL_PREFIX = "__MAILBRIDGE_EXIT__ "
+CODEX_SESSION_DIR = Path.home() / ".codex" / "sessions"
+POLL_INTERVAL_SECONDS = 0.25
+READY_TIMEOUT_SECONDS = 30.0
+SESSION_TIMEOUT_SECONDS = 45.0
+TURN_TIMEOUT_SECONDS = 45.0
+KEYSTROKE_DELAY_SECONDS = 0.02
+SUBMIT_DELAY_SECONDS = 0.25
 
 
 @dataclass(slots=True)
 class StartedTurn:
     pane_id: str
     log_path: str
+    thread_id: str | None = None
+    turn_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -89,15 +98,15 @@ class CodexExecManager:
         resume_session_id: str | None,
     ) -> StartedTurn:
         session_name = self.ensure_tmux_session(agent_id)
-        log_dir = self.config.runtime.state_dir / "runs" / agent_id
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"{pending_turn_id}.jsonl"
         window_name = self._window_name(agent_id, pending_turn_id)
+        session_path = self._session_path_for_id(resume_session_id) if resume_session_id else None
+        if resume_session_id and session_path is None:
+            raise RuntimeError(f"Could not locate Codex session file for {resume_session_id}")
+
+        launched_at = time.time()
         shell_command = self._build_shell_command(
             workspace=workspace,
-            prompt=prompt,
             image_paths=image_paths,
-            log_path=log_path,
             resume_session_id=resume_session_id,
         )
         proc = subprocess.run(
@@ -124,9 +133,27 @@ class CodexExecManager:
         window_id, pane_id = output
         if not pane_id:
             raise RuntimeError("tmux did not return a pane id")
+
+        self._wait_for_codex_ready(pane_id)
+        turn_id: str | None = None
+        if session_path is None:
+            self._send_prompt(pane_id, prompt)
+            session_path, resume_session_id = self._wait_for_new_session(workspace, launched_at)
+            turn_id = self._wait_for_turn_id(session_path, 0)
+        assert session_path is not None
+        if resume_session_id is not None and turn_id is None:
+            pre_submit_size = session_path.stat().st_size if session_path.exists() else 0
+            self._send_prompt(pane_id, prompt)
+            turn_id = self._wait_for_turn_id(session_path, pre_submit_size)
+
         if not self._session_has_attached_clients(session_name):
             subprocess.run(["tmux", "select-window", "-t", window_id], check=False)
-        return StartedTurn(pane_id=pane_id, log_path=str(log_path))
+        return StartedTurn(
+            pane_id=pane_id,
+            log_path=str(session_path),
+            thread_id=resume_session_id,
+            turn_id=turn_id,
+        )
 
     def interrupt_turn(self, pane_id: str) -> None:
         subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-c"], check=False)
@@ -140,108 +167,278 @@ class CodexExecManager:
         )
         return result.returncode == 0 and result.stdout.strip() == pane_id
 
-    def read_turn_state(self, log_path: str | None) -> ExecTurnState:
+    def pane_running_codex(self, pane_id: str) -> bool:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane_id, "#{pane_dead} #{pane_current_command}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return False
+        parts = result.stdout.strip().split(maxsplit=1)
+        if len(parts) != 2:
+            return False
+        pane_dead, current_command = parts
+        return pane_dead == "0" and current_command in {"codex", "node"}
+
+    def read_turn_state(self, log_path: str | None, codex_turn_id: str | None = None) -> ExecTurnState:
         state = ExecTurnState()
         if not log_path:
             return state
         path = Path(log_path)
         if not path.exists():
             return state
+
+        target_turn_id = codex_turn_id if codex_turn_id and not codex_turn_id.startswith("pending:") else None
+        capturing = target_turn_id is None
+        active_turn_id: str | None = None
+
         for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = raw_line.strip()
             if not line:
                 continue
-            if line.startswith(EXIT_SENTINEL_PREFIX):
-                suffix = line[len(EXIT_SENTINEL_PREFIX) :].strip()
-                try:
-                    state.exit_code = int(suffix)
-                except ValueError:
-                    LOG.warning("Ignoring invalid Codex exit sentinel: %s", line)
-                continue
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
-                LOG.warning("Ignoring non-JSON Codex log line: %s", line)
+                LOG.warning("Ignoring non-JSON Codex session line: %s", line)
                 continue
+
             event_type = event.get("type")
-            if event_type == "thread.started":
-                thread_id = str(event.get("thread_id", "")).strip()
+            if event_type == "session_meta":
+                payload = event.get("payload", {})
+                thread_id = str(payload.get("id", "")).strip()
                 if thread_id:
                     state.thread_id = thread_id
                 continue
-            if event_type == "item.completed":
-                item = event.get("item", {})
-                if item.get("type") != "agent_message":
-                    continue
-                text = str(item.get("text", "")).strip()
+
+            if event_type != "event_msg":
+                continue
+
+            payload = event.get("payload", {})
+            payload_type = str(payload.get("type", "")).strip()
+            if payload_type == "task_started":
+                next_turn_id = str(payload.get("turn_id", "")).strip() or None
+                if target_turn_id and active_turn_id == target_turn_id and next_turn_id != target_turn_id and not state.turn_completed and state.turn_failed is None:
+                    state.turn_failed = "Codex started a newer turn before finishing this one."
+                    state.exit_code = 1
+                    break
+                active_turn_id = next_turn_id
+                if target_turn_id is None:
+                    capturing = True
+                    state.first_agent_text = ""
+                    state.last_agent_text = ""
+                    state.errors.clear()
+                    state.turn_completed = False
+                    state.turn_failed = None
+                    state.exit_code = None
+                else:
+                    capturing = active_turn_id == target_turn_id
+                continue
+
+            if not capturing:
+                continue
+
+            if payload_type == "agent_message":
+                text = str(payload.get("message", "")).strip()
                 if not text:
                     continue
                 if not state.first_agent_text:
                     state.first_agent_text = text
                 state.last_agent_text = text
                 continue
-            if event_type == "error":
-                message = str(event.get("message", "")).strip()
+
+            if payload_type == "task_complete":
+                completed_turn_id = str(payload.get("turn_id", "")).strip()
+                if target_turn_id and completed_turn_id != target_turn_id:
+                    continue
+                last_message = str(payload.get("last_agent_message", "")).strip()
+                if last_message:
+                    if not state.first_agent_text:
+                        state.first_agent_text = last_message
+                    state.last_agent_text = last_message
+                state.turn_completed = True
+                state.exit_code = 0
+                continue
+
+            if payload_type == "task_interrupted":
+                state.turn_failed = str(payload.get("message", "")).strip() or "interrupted"
+                state.exit_code = 130
+                continue
+
+            if payload_type == "error":
+                message = str(payload.get("message", "")).strip()
                 if message:
                     state.errors.append(message)
                 continue
-            if event_type == "turn.failed":
-                error = event.get("error", {})
-                message = str(error.get("message", "")).strip()
-                if message:
-                    state.turn_failed = message
-                continue
-            if event_type == "turn.completed":
-                state.turn_completed = True
+
         return state
 
     def _build_shell_command(
         self,
         *,
         workspace: Path,
-        prompt: str,
         image_paths: list[str],
-        log_path: Path,
         resume_session_id: str | None,
     ) -> str:
         argv = self._build_codex_argv(
             workspace=workspace,
-            prompt=prompt,
             image_paths=image_paths,
             resume_session_id=resume_session_id,
         )
-        quoted_log_path = shlex.quote(str(log_path))
-        sentinel_format = shlex.quote(EXIT_SENTINEL_PREFIX + "%s\n")
-        shell_script = (
-            "set -o pipefail\n"
-            f"{shlex.join(argv)} 2>&1 | tee {quoted_log_path}\n"
-            "status=${PIPESTATUS[0]}\n"
-            f"printf {sentinel_format} \"$status\" >> {quoted_log_path}\n"
-            "exit \"$status\""
-        )
-        return f"/usr/bin/bash -lc {shlex.quote(shell_script)}"
+        return f"/usr/bin/bash -lc {shlex.quote(shlex.join(argv))}"
 
     def _build_codex_argv(
         self,
         *,
         workspace: Path,
-        prompt: str,
         image_paths: list[str],
         resume_session_id: str | None,
     ) -> list[str]:
-        common = [
-            self.codex_bin,
-            "exec",
-            "--json",
-            "--skip-git-repo-check",
-            "--cd",
-            str(workspace),
-        ]
-        for image_path in image_paths:
-            common.extend(["-i", image_path])
         if resume_session_id:
-            return [*common, "resume", resume_session_id, prompt]
-        return [*common, prompt]
+            argv = [
+                self.codex_bin,
+                "resume",
+                "--no-alt-screen",
+                "-C",
+                str(workspace),
+            ]
+        else:
+            argv = [
+                self.codex_bin,
+                "--no-alt-screen",
+                "-C",
+                str(workspace),
+            ]
+        for image_path in image_paths:
+            argv.extend(["-i", image_path])
+        if resume_session_id:
+            argv.append(resume_session_id)
+        return argv
+
+    def _wait_for_codex_ready(self, pane_id: str) -> None:
+        deadline = time.monotonic() + READY_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            pane_text = self._capture_pane(pane_id)
+            if "Press enter to continue" in pane_text:
+                subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-m"], check=False)
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+            if "OpenAI Codex" in pane_text:
+                return
+            if not self.pane_exists(pane_id):
+                raise RuntimeError("Codex pane exited before the TUI became ready.")
+            time.sleep(POLL_INTERVAL_SECONDS)
+        raise RuntimeError("Timed out waiting for Codex TUI to become ready.")
+
+    def _wait_for_new_session(self, workspace: Path, launched_at: float) -> tuple[Path, str]:
+        deadline = time.monotonic() + SESSION_TIMEOUT_SECONDS
+        workspace_str = str(workspace)
+        while time.monotonic() < deadline:
+            candidates: list[tuple[float, Path, str]] = []
+            for path in self._session_files():
+                try:
+                    stat = path.stat()
+                except FileNotFoundError:
+                    continue
+                if stat.st_mtime < launched_at - 1:
+                    continue
+                session_id, cwd = self._read_session_meta(path)
+                if not session_id or cwd != workspace_str:
+                    continue
+                candidates.append((stat.st_mtime, path, session_id))
+            if candidates:
+                _, path, session_id = max(candidates, key=lambda item: item[0])
+                return path, session_id
+            time.sleep(POLL_INTERVAL_SECONDS)
+        raise RuntimeError("Timed out waiting for a new Codex session file.")
+
+    def _wait_for_turn_id(self, session_path: Path, start_size: int) -> str:
+        deadline = time.monotonic() + TURN_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            for raw_line in self._session_lines_since(session_path, start_size):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "event_msg":
+                    continue
+                payload = event.get("payload", {})
+                if payload.get("type") != "task_started":
+                    continue
+                turn_id = str(payload.get("turn_id", "")).strip()
+                if turn_id:
+                    return turn_id
+            time.sleep(POLL_INTERVAL_SECONDS)
+        raise RuntimeError("Timed out waiting for Codex to accept the prompt.")
+
+    def _send_prompt(self, pane_id: str, prompt: str) -> None:
+        lines = prompt.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        for index, line in enumerate(lines):
+            if line:
+                subprocess.run(["tmux", "send-keys", "-l", "-t", pane_id, "--", line], check=False)
+                time.sleep(KEYSTROKE_DELAY_SECONDS)
+            if index < len(lines) - 1:
+                subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-j"], check=False)
+                time.sleep(KEYSTROKE_DELAY_SECONDS)
+        time.sleep(SUBMIT_DELAY_SECONDS)
+        subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], check=False)
+
+    def _session_path_for_id(self, session_id: str | None) -> Path | None:
+        if not session_id:
+            return None
+        matches = sorted(CODEX_SESSION_DIR.rglob(f"*{session_id}.jsonl"))
+        if matches:
+            return matches[-1]
+        for path in self._session_files():
+            found_session_id, _ = self._read_session_meta(path)
+            if found_session_id == session_id:
+                return path
+        return None
+
+    def _read_session_meta(self, path: Path) -> tuple[str | None, str | None]:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                first_line = handle.readline().strip()
+        except FileNotFoundError:
+            return None, None
+        if not first_line:
+            return None, None
+        try:
+            event = json.loads(first_line)
+        except json.JSONDecodeError:
+            return None, None
+        if event.get("type") != "session_meta":
+            return None, None
+        payload = event.get("payload", {})
+        session_id = str(payload.get("id", "")).strip() or None
+        cwd = str(payload.get("cwd", "")).strip() or None
+        return session_id, cwd
+
+    def _session_files(self) -> list[Path]:
+        if not CODEX_SESSION_DIR.exists():
+            return []
+        return [path for path in CODEX_SESSION_DIR.rglob("*.jsonl") if path.is_file()]
+
+    def _session_lines_since(self, session_path: Path, start_size: int) -> list[str]:
+        try:
+            with session_path.open("r", encoding="utf-8", errors="replace") as handle:
+                handle.seek(start_size)
+                return handle.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def _capture_pane(self, pane_id: str) -> str:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", pane_id],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.stdout
 
     def _window_name(self, agent_id: str, pending_turn_id: int) -> str:
         sanitized = re.sub(r"[^A-Za-z0-9_-]+", "-", agent_id).strip("-") or "agent"

@@ -16,12 +16,17 @@ class _FakeExec:
     def start_turn(self, **kwargs) -> StartedTurn:
         self.started.append(kwargs)
         self.live_panes.add("%1")
-        return StartedTurn(pane_id="%1", log_path="/tmp/turn.jsonl")
+        return StartedTurn(
+            pane_id="%1",
+            log_path="/tmp/turn.jsonl",
+            thread_id="session-123",
+            turn_id="turn-123",
+        )
 
-    def read_turn_state(self, log_path: str | None) -> ExecTurnState:
+    def read_turn_state(self, log_path: str | None, codex_turn_id: str | None = None) -> ExecTurnState:
         return self.state
 
-    def pane_exists(self, pane_id: str) -> bool:
+    def pane_running_codex(self, pane_id: str) -> bool:
         return pane_id in self.live_panes
 
 class _FakeGmail:
@@ -85,7 +90,8 @@ def test_supersede_pending_turns_interrupts_running_and_deletes_only_queued() ->
 
 class _StartDB:
     def __init__(self) -> None:
-        self.marked: list[tuple[int, str | None, str | None]] = []
+        self.marked: list[tuple[int, str | None, str | None, str | None]] = []
+        self.updated_thread_ids: list[tuple[str, str]] = []
 
     def tracked_threads(self):
         return [
@@ -118,8 +124,11 @@ class _StartDB:
             runner_log_path=None,
         )
 
+    def update_thread_codex_id(self, agent_id: str, codex_thread_id: str) -> None:
+        self.updated_thread_ids.append((agent_id, codex_thread_id))
+
     def mark_turn_running(self, pending_turn_id: int, *, runner_pane_id: str | None = None, runner_log_path: str | None = None, codex_turn_id: str | None = None) -> None:
-        self.marked.append((pending_turn_id, runner_pane_id, runner_log_path))
+        self.marked.append((pending_turn_id, codex_turn_id, runner_pane_id, runner_log_path))
 
 
 def test_start_queued_turn_uses_resume_session_id() -> None:
@@ -139,7 +148,8 @@ def test_start_queued_turn_uses_resume_session_id() -> None:
             "resume_session_id": "session-123",
         }
     ]
-    assert daemon.db.marked == [(7, "%1", "/tmp/turn.jsonl")]
+    assert daemon.db.updated_thread_ids == []
+    assert daemon.db.marked == [(7, "turn-123", "%1", "/tmp/turn.jsonl")]
 
 
 class _SyncDB:
@@ -192,7 +202,7 @@ def _pending() -> PendingTurn:
         image_paths=[],
         attachment_paths=[],
         status="running",
-        codex_turn_id="pending:1",
+        codex_turn_id="turn-123",
         runner_pane_id="%1",
         runner_log_path="/tmp/turn.jsonl",
     )
@@ -254,3 +264,23 @@ def test_sync_pending_turn_does_not_email_interrupted_failure() -> None:
 
     assert daemon.db.finished == [(1, "interrupted")]
     assert daemon.gmail.calls == []
+
+
+def test_sync_pending_turn_marks_missing_codex_process_as_failure() -> None:
+    daemon = object.__new__(MailBridgeDaemon)
+    daemon.db = _SyncDB()
+    daemon.gmail = _FakeGmail()
+    daemon.exec = _FakeExec()
+    daemon.exec.live_panes.clear()
+
+    daemon._sync_pending_turn(daemon.db.thread, _pending())
+
+    assert daemon.db.finished == [(1, "Codex exited without a final status.")]
+    assert daemon.gmail.calls == [
+        {
+            "subject": "Re: subject",
+            "markdown_body": "Codex error:\n\nCodex exited without a final status.",
+            "parent_message_id": "<reply@msg>",
+            "references": ["<last@msg>"],
+        }
+    ]

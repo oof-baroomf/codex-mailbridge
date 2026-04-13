@@ -3,7 +3,7 @@
 Local daemon that:
 
 - polls a mailbox for messages from one allowed sender
-- maps Gmail threads to direct `codex exec` sessions instead of using `app-server`
+- maps Gmail threads to direct interactive Codex TUI sessions instead of using `app-server`
 - runs every mailbridge-owned Codex thread inside its own tmux session named `codex-mailbridge-<agent>`
 - inherits the normal global Codex CLI settings instead of forcing model/auth/agent overrides
 - saves attachments into the workspace named in the first message subject

@@ -23,6 +23,7 @@ SESSION_TIMEOUT_SECONDS = 45.0
 TURN_TIMEOUT_SECONDS = 45.0
 KEYSTROKE_DELAY_SECONDS = 0.02
 SUBMIT_DELAY_SECONDS = 0.25
+RESUBMIT_DELAY_SECONDS = 2.0
 
 
 @dataclass(slots=True)
@@ -138,7 +139,7 @@ class CodexExecManager:
         turn_id: str | None = None
         if session_path is None:
             self._send_prompt(pane_id, prompt)
-            session_path, resume_session_id = self._wait_for_new_session(workspace, launched_at)
+            session_path, resume_session_id = self._wait_for_new_session(workspace, launched_at, pane_id)
             turn_id = self._wait_for_turn_id(session_path, 0)
         assert session_path is not None
         if resume_session_id is not None and turn_id is None:
@@ -335,9 +336,11 @@ class CodexExecManager:
             time.sleep(POLL_INTERVAL_SECONDS)
         raise RuntimeError("Timed out waiting for Codex TUI to become ready.")
 
-    def _wait_for_new_session(self, workspace: Path, launched_at: float) -> tuple[Path, str]:
+    def _wait_for_new_session(self, workspace: Path, launched_at: float, pane_id: str) -> tuple[Path, str]:
         deadline = time.monotonic() + SESSION_TIMEOUT_SECONDS
         workspace_str = str(workspace)
+        resubmitted = False
+        resubmit_at = time.monotonic() + RESUBMIT_DELAY_SECONDS
         while time.monotonic() < deadline:
             candidates: list[tuple[float, Path, str]] = []
             for path in self._session_files():
@@ -354,6 +357,13 @@ class CodexExecManager:
             if candidates:
                 _, path, session_id = max(candidates, key=lambda item: item[0])
                 return path, session_id
+            if not resubmitted and time.monotonic() >= resubmit_at:
+                pane_text = self._capture_pane(pane_id)
+                if self._pane_text_indicates_ready(pane_text) and not self._pane_text_indicates_working(pane_text):
+                    self._submit_prompt(pane_id)
+                    resubmitted = True
+                elif not self.pane_exists(pane_id):
+                    raise RuntimeError("Codex pane exited before a new session file was created.")
             time.sleep(POLL_INTERVAL_SECONDS)
         raise RuntimeError("Timed out waiting for a new Codex session file.")
 
@@ -389,7 +399,7 @@ class CodexExecManager:
                 subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-j"], check=False)
                 time.sleep(KEYSTROKE_DELAY_SECONDS)
         time.sleep(SUBMIT_DELAY_SECONDS)
-        subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], check=False)
+        self._submit_prompt(pane_id)
 
     def _session_path_for_id(self, session_id: str | None) -> Path | None:
         if not session_id:
@@ -445,13 +455,18 @@ class CodexExecManager:
         return result.stdout
 
     def _pane_text_indicates_ready(self, pane_text: str) -> bool:
-        if "OpenAI Codex" in pane_text:
-            return True
         for line in pane_text.splitlines():
             stripped = line.strip()
-            if stripped.startswith("› "):
+            if stripped == "›" or stripped.startswith("› "):
                 return True
         return False
+
+    def _pane_text_indicates_working(self, pane_text: str) -> bool:
+        lowered = pane_text.lower()
+        return "esc to interrupt" in lowered or "working (" in lowered or "working…" in lowered
+
+    def _submit_prompt(self, pane_id: str) -> None:
+        subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-m"], check=False)
 
     def _window_name(self, agent_id: str, pending_turn_id: int) -> str:
         sanitized = re.sub(r"[^A-Za-z0-9_-]+", "-", agent_id).strip("-") or "agent"

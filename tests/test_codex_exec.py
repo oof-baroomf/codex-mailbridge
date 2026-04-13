@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 
 from codex_mailbridge.codex_exec import CODEX_SESSION_DIR, CodexExecManager, TMUX_SESSION_PREFIX
 from codex_mailbridge.config import (
@@ -157,3 +158,85 @@ def test_pane_text_indicates_ready_for_resumed_prompt() -> None:
 """
 
     assert manager._pane_text_indicates_ready(pane_text) is True
+
+
+def test_pane_text_indicates_ready_for_empty_prompt() -> None:
+    manager = CodexExecManager(_config())
+
+    pane_text = """
+╭────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.121.0-alpha.2)         │
+╰────────────────────────────────────────────╯
+
+›
+
+  gpt-5.4 high · ~/coding · Context [     ] · weekly 68%
+"""
+
+    assert manager._pane_text_indicates_ready(pane_text) is True
+
+
+def test_pane_text_indicates_not_ready_for_header_only_splash() -> None:
+    manager = CodexExecManager(_config())
+
+    pane_text = """
+╭────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.121.0-alpha.2)         │
+│                                            │
+│ model:     gpt-5.4 high   /model to change │
+│ directory: ~/coding                        │
+╰────────────────────────────────────────────╯
+"""
+
+    assert manager._pane_text_indicates_ready(pane_text) is False
+
+
+def test_pane_text_indicates_working_for_active_turn() -> None:
+    manager = CodexExecManager(_config())
+
+    pane_text = """
+› Create a new github repo
+
+• Working (0s • esc to interrupt)
+"""
+
+    assert manager._pane_text_indicates_working(pane_text) is True
+
+
+def test_wait_for_new_session_resubmits_idle_prompt_once(tmp_path: Path, monkeypatch) -> None:
+    manager = CodexExecManager(_config())
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    session_path = tmp_path / "rollout-session-123.jsonl"
+    state = {"submitted": 0, "clock": -0.5}
+
+    def fake_submit(pane_id: str) -> None:
+        assert pane_id == "%1"
+        state["submitted"] += 1
+        session_path.write_text(
+            '{"type":"session_meta","payload":{"id":"session-123","cwd":"%s"}}\n' % workspace,
+            encoding="utf-8",
+        )
+        os.utime(session_path, (10, 10))
+
+    def fake_session_files() -> list[Path]:
+        if state["submitted"]:
+            return [session_path]
+        return []
+
+    def fake_monotonic() -> float:
+        state["clock"] += 0.5
+        return state["clock"]
+
+    monkeypatch.setattr(manager, "_submit_prompt", fake_submit)
+    monkeypatch.setattr(manager, "_session_files", fake_session_files)
+    monkeypatch.setattr(manager, "_capture_pane", lambda pane_id: "› Create a new github repo")
+    monkeypatch.setattr(manager, "pane_exists", lambda pane_id: True)
+    monkeypatch.setattr("codex_mailbridge.codex_exec.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("codex_mailbridge.codex_exec.time.sleep", lambda seconds: None)
+
+    found_path, session_id = manager._wait_for_new_session(workspace, launched_at=0.0, pane_id="%1")
+
+    assert found_path == session_path
+    assert session_id == "session-123"
+    assert state["submitted"] == 1

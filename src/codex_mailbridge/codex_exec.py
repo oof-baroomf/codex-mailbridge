@@ -189,35 +189,6 @@ class CodexExecManager:
                 state.turn_completed = True
         return state
 
-    def ensure_tui_window(self, *, agent_id: str, workspace: Path, session_id: str) -> None:
-        self.ensure_tmux_session()
-        window_name = self._tui_window_name(agent_id)
-        if self._window_is_live(window_name):
-            return
-        if self._window_exists(window_name):
-            subprocess.run(["tmux", "kill-window", "-t", f"{TMUX_SESSION_NAME}:{window_name}"], check=False)
-        proc = subprocess.run(
-            [
-                "tmux",
-                "new-window",
-                "-d",
-                "-P",
-                "-F",
-                "#{window_id}",
-                "-t",
-                TMUX_SESSION_NAME,
-                "-n",
-                window_name,
-                self._build_tui_command(workspace=workspace, session_id=session_id),
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        window_id = proc.stdout.strip()
-        if window_id and not self._session_has_attached_clients():
-            subprocess.run(["tmux", "select-window", "-t", window_id], check=False)
-
     def _build_shell_command(
         self,
         *,
@@ -244,18 +215,6 @@ class CodexExecManager:
         )
         return f"/usr/bin/bash -lc {shlex.quote(shell_script)}"
 
-    def _build_tui_command(self, *, workspace: Path, session_id: str) -> str:
-        argv = [
-            self.codex_bin,
-            "resume",
-            "--include-non-interactive",
-            "--cd",
-            str(workspace),
-            "--no-alt-screen",
-            session_id,
-        ]
-        return shlex.join(argv)
-
     def _build_codex_argv(
         self,
         *,
@@ -281,41 +240,6 @@ class CodexExecManager:
     def _window_name(self, agent_id: str, pending_turn_id: int) -> str:
         sanitized = re.sub(r"[^A-Za-z0-9_-]+", "-", agent_id).strip("-") or "agent"
         return f"{pending_turn_id}-{sanitized[:40]}"
-
-    def _tui_window_name(self, agent_id: str) -> str:
-        sanitized = re.sub(r"[^A-Za-z0-9_-]+", "-", agent_id).strip("-") or "agent"
-        return f"tui-{sanitized[:36]}"
-
-    def _window_exists(self, window_name: str) -> bool:
-        result = subprocess.run(
-            ["tmux", "list-panes", "-t", f"{TMUX_SESSION_NAME}:{window_name}"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return result.returncode == 0
-
-    def _window_is_live(self, window_name: str) -> bool:
-        result = subprocess.run(
-            [
-                "tmux",
-                "list-panes",
-                "-t",
-                f"{TMUX_SESSION_NAME}:{window_name}",
-                "-F",
-                "#{pane_dead} #{pane_current_command}",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            return False
-        for line in result.stdout.splitlines():
-            dead, _, command = line.partition(" ")
-            if dead == "0" and command.strip():
-                return True
-        return False
 
     def _session_has_attached_clients(self) -> bool:
         result = subprocess.run(

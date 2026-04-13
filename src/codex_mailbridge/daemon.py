@@ -296,14 +296,6 @@ class MailBridgeDaemon:
             self.db.update_thread_codex_id(thread.agent_id, state.thread_id)
             thread = self._fresh_thread(thread)
 
-        session_id = state.thread_id or _session_id_for_thread(thread)
-        if session_id:
-            self.exec.ensure_tui_window(
-                agent_id=thread.agent_id,
-                workspace=Path(thread.workspace_path),
-                session_id=session_id,
-            )
-
         turn_key = self._turn_key(pending)
         if state.first_agent_text and not self.db.turn_email_exists(turn_key, "assistant_progress"):
             self._send_turn_progress_reply(thread, pending, state.first_agent_text)

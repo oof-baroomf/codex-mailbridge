@@ -7,7 +7,6 @@ class _FakeExec:
     def __init__(self) -> None:
         self.interrupted: list[str] = []
         self.started: list[dict] = []
-        self.tui_windows: list[dict] = []
         self.state = ExecTurnState()
         self.live_panes: set[str] = set()
 
@@ -24,10 +23,6 @@ class _FakeExec:
 
     def pane_exists(self, pane_id: str) -> bool:
         return pane_id in self.live_panes
-
-    def ensure_tui_window(self, **kwargs) -> None:
-        self.tui_windows.append(kwargs)
-
 
 class _FakeGmail:
     def __init__(self) -> None:
@@ -218,13 +213,6 @@ def test_sync_pending_turn_sends_progress_and_final_reply() -> None:
     daemon._sync_pending_turn(daemon.db.thread, _pending())
 
     assert daemon.db.updated_thread_ids == [("agent-1", "session-123")]
-    assert daemon.exec.tui_windows == [
-        {
-            "agent_id": "agent-1",
-            "workspace": daemon.exec.tui_windows[0]["workspace"],
-            "session_id": "session-123",
-        }
-    ]
     assert daemon.db.finished == [(1, None)]
     assert [call["markdown_body"] for call in daemon.gmail.calls] == ["working", "done"]
 

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from codex_mailbridge.codex_exec import CodexExecManager, EXIT_SENTINEL_PREFIX
+from codex_mailbridge.codex_exec import CodexExecManager, EXIT_SENTINEL_PREFIX, TMUX_SESSION_PREFIX
 from codex_mailbridge.config import (
     AppPasswordConfig,
     Config,
@@ -48,6 +48,12 @@ def test_build_codex_argv_uses_exec_resume_for_existing_session() -> None:
     assert "resume" in argv
     assert argv[-2:] == ["session-123", "continue"]
     assert argv.count("-i") == 1
+
+
+def test_session_name_is_per_agent() -> None:
+    manager = CodexExecManager(_config())
+
+    assert manager._session_name("some questions") == f"{TMUX_SESSION_PREFIX}-some-questions"
 
 
 def test_build_shell_command_streams_to_tmux_and_log() -> None:

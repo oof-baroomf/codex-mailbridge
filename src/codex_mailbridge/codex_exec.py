@@ -14,7 +14,7 @@ from .config import Config
 
 LOG = logging.getLogger(__name__)
 DEFAULT_CODEX_BIN = "/home/d/.bun/bin/codex"
-TMUX_SESSION_NAME = "codex-mailbridge"
+TMUX_SESSION_PREFIX = "codex-mailbridge"
 EXIT_SENTINEL_PREFIX = "__MAILBRIDGE_EXIT__ "
 
 
@@ -58,19 +58,25 @@ class CodexExecManager:
         self.config = config
         self.codex_bin = shutil.which("codex") or DEFAULT_CODEX_BIN
 
-    def ensure_tmux_session(self) -> None:
+    def _session_name(self, agent_id: str) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9_-]+", "-", agent_id).strip("-") or "agent"
+        return f"{TMUX_SESSION_PREFIX}-{sanitized[:40]}"
+
+    def ensure_tmux_session(self, agent_id: str) -> str:
+        session_name = self._session_name(agent_id)
         exists = subprocess.run(
-            ["tmux", "has-session", "-t", TMUX_SESSION_NAME],
+            ["tmux", "has-session", "-t", session_name],
             capture_output=True,
             text=True,
             check=False,
         )
         if exists.returncode == 0:
-            return
+            return session_name
         subprocess.run(
-            ["tmux", "new-session", "-d", "-s", TMUX_SESSION_NAME, "-n", "mailbridge", "sleep infinity"],
+            ["tmux", "new-session", "-d", "-s", session_name, "-n", "mailbridge", "sleep infinity"],
             check=True,
         )
+        return session_name
 
     def start_turn(
         self,
@@ -82,7 +88,7 @@ class CodexExecManager:
         image_paths: list[str],
         resume_session_id: str | None,
     ) -> StartedTurn:
-        self.ensure_tmux_session()
+        session_name = self.ensure_tmux_session(agent_id)
         log_dir = self.config.runtime.state_dir / "runs" / agent_id
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{pending_turn_id}.jsonl"
@@ -103,7 +109,7 @@ class CodexExecManager:
                 "-F",
                 "#{window_id} #{pane_id}",
                 "-t",
-                TMUX_SESSION_NAME,
+                session_name,
                 "-n",
                 window_name,
                 shell_command,
@@ -118,7 +124,7 @@ class CodexExecManager:
         window_id, pane_id = output
         if not pane_id:
             raise RuntimeError("tmux did not return a pane id")
-        if not self._session_has_attached_clients():
+        if not self._session_has_attached_clients(session_name):
             subprocess.run(["tmux", "select-window", "-t", window_id], check=False)
         return StartedTurn(pane_id=pane_id, log_path=str(log_path))
 
@@ -241,9 +247,9 @@ class CodexExecManager:
         sanitized = re.sub(r"[^A-Za-z0-9_-]+", "-", agent_id).strip("-") or "agent"
         return f"{pending_turn_id}-{sanitized[:40]}"
 
-    def _session_has_attached_clients(self) -> bool:
+    def _session_has_attached_clients(self, session_name: str) -> bool:
         result = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", TMUX_SESSION_NAME, "#{session_attached}"],
+            ["tmux", "display-message", "-p", "-t", session_name, "#{session_attached}"],
             capture_output=True,
             text=True,
             check=False,

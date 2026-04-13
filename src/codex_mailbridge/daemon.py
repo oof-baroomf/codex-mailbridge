@@ -106,7 +106,6 @@ class MailBridgeDaemon:
         self.auth_warning_logged = False
 
     def run(self) -> None:
-        self.exec.ensure_tmux_session()
         LOG.info("codex-mailbridge started")
         next_inbox_poll = 0.0
         while True:

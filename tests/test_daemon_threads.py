@@ -31,6 +31,9 @@ class _FakeExec:
     def read_turn_state(self, log_path: str | None, codex_turn_id: str | None = None) -> ExecTurnState:
         return self.state
 
+    def find_turn_id_since(self, log_path: str | None, started_at: int) -> str | None:
+        return None
+
     def pane_running_codex(self, pane_id: str) -> bool:
         return pane_id in self.live_panes
 
@@ -49,6 +52,7 @@ class _FakeGmail:
 class _QueueDB:
     def __init__(self) -> None:
         self.enqueued: list[dict] = []
+        self.submitted: list[tuple[int, str | None, str | None]] = []
         self.updated_reply_to: list[tuple[int, str | None]] = []
         self.deleted: list[int] = []
         self.thread = type(
@@ -79,6 +83,7 @@ class _QueueDB:
                 attachment_paths=[],
                 status="running",
                 codex_turn_id="turn-2",
+                started_at=123,
                 runner_pane_id="%2",
                 runner_log_path="/tmp/2.jsonl",
             ),
@@ -92,14 +97,19 @@ class _QueueDB:
                 attachment_paths=[],
                 status="queued",
                 codex_turn_id=None,
+                started_at=None,
                 runner_pane_id=None,
                 runner_log_path=None,
             ),
         ]
         return [turn for turn in turns if turn.status in statuses]
 
-    def enqueue_turn(self, **kwargs) -> None:
+    def enqueue_turn(self, **kwargs) -> int:
         self.enqueued.append(kwargs)
+        return 4
+
+    def mark_turn_submitted(self, pending_turn_id: int, *, runner_pane_id: str | None = None, runner_log_path: str | None = None) -> None:
+        self.submitted.append((pending_turn_id, runner_pane_id, runner_log_path))
 
     def update_turn_reply_to_message_id(self, pending_turn_id: int, reply_to_message_id: str | None) -> None:
         self.updated_reply_to.append((pending_turn_id, reply_to_message_id))
@@ -108,7 +118,7 @@ class _QueueDB:
         self.deleted = pending_turn_ids
 
 
-def test_handle_incoming_running_thread_enqueues_without_interrupting(monkeypatch) -> None:
+def test_handle_incoming_running_thread_injects_without_interrupting(monkeypatch) -> None:
     from codex_mailbridge.daemon import IncomingMail
 
     daemon = object.__new__(MailBridgeDaemon)
@@ -133,8 +143,18 @@ def test_handle_incoming_running_thread_enqueues_without_interrupting(monkeypatc
 
     assert daemon.exec.interrupted == []
     assert daemon.exec.sent_prompts == [("%2", "new request")]
-    assert daemon.db.updated_reply_to == [(2, "<reply@msg>")]
-    assert daemon.db.enqueued == []
+    assert daemon.db.enqueued == [
+        {
+            "agent_id": "agent-1",
+            "gmail_message_id": "m4",
+            "reply_to_message_id": "<reply@msg>",
+            "text_body": "new request",
+            "image_paths": [],
+            "attachment_paths": [],
+        }
+    ]
+    assert daemon.db.submitted == [(4, "%2", "/tmp/2.jsonl")]
+    assert daemon.db.updated_reply_to == []
     assert daemon.db.deleted == []
 
 
@@ -171,6 +191,7 @@ class _EndDB:
                 attachment_paths=[],
                 status="queued",
                 codex_turn_id="pending:1",
+                started_at=None,
                 runner_pane_id=None,
                 runner_log_path=None,
             ),
@@ -184,6 +205,7 @@ class _EndDB:
                 attachment_paths=[],
                 status="running",
                 codex_turn_id="turn-2",
+                started_at=123,
                 runner_pane_id="%2",
                 runner_log_path="/tmp/2.jsonl",
             ),
@@ -232,6 +254,7 @@ class _StartDB:
             attachment_paths=[],
             status="queued",
             codex_turn_id=None,
+            started_at=None,
             runner_pane_id=None,
             runner_log_path=None,
         )
@@ -315,6 +338,7 @@ def _pending() -> PendingTurn:
         attachment_paths=[],
         status="running",
         codex_turn_id="turn-123",
+        started_at=123,
         runner_pane_id="%1",
         runner_log_path="/tmp/turn.jsonl",
     )

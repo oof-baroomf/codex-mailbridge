@@ -28,6 +28,7 @@ class PendingTurn:
     attachment_paths: list[str]
     status: str
     codex_turn_id: str | None
+    started_at: int | None
     runner_pane_id: str | None
     runner_log_path: str | None
 
@@ -125,6 +126,7 @@ class StateDB:
             attachment_paths=json.loads(row["attachment_paths_json"]),
             status=row["status"],
             codex_turn_id=row["codex_turn_id"],
+            started_at=row["started_at"],
             runner_pane_id=row["runner_pane_id"],
             runner_log_path=row["runner_log_path"],
         )
@@ -240,8 +242,8 @@ class StateDB:
         text_body: str,
         image_paths: list[str],
         attachment_paths: list[str],
-    ) -> None:
-        self.conn.execute(
+    ) -> int:
+        cursor = self.conn.execute(
             """
             INSERT INTO pending_turns
             (agent_id, gmail_message_id, reply_to_message_id, text_body, image_paths_json, attachment_paths_json, status, created_at)
@@ -258,11 +260,13 @@ class StateDB:
             ),
         )
         self.conn.commit()
+        return int(cursor.lastrowid)
 
     def next_queued_turn(self, agent_id: str) -> PendingTurn | None:
         row = self.conn.execute(
             """
             SELECT id, agent_id, gmail_message_id, reply_to_message_id, text_body, image_paths_json, attachment_paths_json, status, codex_turn_id, runner_pane_id, runner_log_path
+                   , started_at
             FROM pending_turns
             WHERE agent_id = ? AND status = 'queued'
             ORDER BY id ASC
@@ -275,12 +279,13 @@ class StateDB:
     def pending_turns_for_agent(
         self,
         agent_id: str,
-        statuses: tuple[str, ...] = ("queued", "running"),
+        statuses: tuple[str, ...] = ("queued", "submitted", "running"),
     ) -> list[PendingTurn]:
         placeholders = ",".join("?" for _ in statuses)
         rows = self.conn.execute(
             f"""
             SELECT id, agent_id, gmail_message_id, reply_to_message_id, text_body, image_paths_json, attachment_paths_json, status, codex_turn_id, runner_pane_id, runner_log_path
+                   , started_at
             FROM pending_turns
             WHERE agent_id = ? AND status IN ({placeholders})
             ORDER BY id ASC
@@ -312,10 +317,31 @@ class StateDB:
         )
         self.conn.commit()
 
+    def mark_turn_submitted(
+        self,
+        pending_turn_id: int,
+        *,
+        runner_pane_id: str | None = None,
+        runner_log_path: str | None = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            UPDATE pending_turns
+            SET status = 'submitted',
+                started_at = ?,
+                runner_pane_id = ?,
+                runner_log_path = ?
+            WHERE id = ?
+            """,
+            (int(time.time()), runner_pane_id, runner_log_path, pending_turn_id),
+        )
+        self.conn.commit()
+
     def pending_turn_by_codex_turn_id(self, codex_turn_id: str) -> PendingTurn | None:
         row = self.conn.execute(
             """
             SELECT id, agent_id, gmail_message_id, reply_to_message_id, text_body, image_paths_json, attachment_paths_json, status, codex_turn_id, runner_pane_id, runner_log_path
+                   , started_at
             FROM pending_turns
             WHERE codex_turn_id = ?
             """,

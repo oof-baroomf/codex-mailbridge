@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 import json
 import logging
 from pathlib import Path
@@ -203,6 +204,40 @@ class CodexExecManager:
             return False
         pane_dead, current_command = parts
         return pane_dead == "0" and current_command in {"codex", "node"}
+
+    def find_turn_id_since(self, log_path: str | None, started_at: int) -> str | None:
+        if not log_path:
+            return None
+        path = Path(log_path)
+        if not path.exists():
+            return None
+
+        for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "event_msg":
+                continue
+            payload = event.get("payload", {})
+            if payload.get("type") != "task_started":
+                continue
+            timestamp_text = str(event.get("timestamp", "")).strip()
+            if not timestamp_text:
+                continue
+            try:
+                timestamp = datetime.fromisoformat(timestamp_text.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if timestamp < started_at:
+                continue
+            turn_id = str(payload.get("turn_id", "")).strip()
+            if turn_id:
+                return turn_id
+        return None
 
     def read_turn_state(self, log_path: str | None, codex_turn_id: str | None = None) -> ExecTurnState:
         state = ExecTurnState()

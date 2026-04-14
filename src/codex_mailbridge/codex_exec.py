@@ -72,7 +72,19 @@ class CodexExecManager:
         sanitized = re.sub(r"[^A-Za-z0-9_-]+", "-", agent_id).strip("-") or "agent"
         return f"{TMUX_SESSION_PREFIX}-{sanitized[:40]}"
 
-    def ensure_tmux_session(self, agent_id: str) -> str:
+    def _window_name(self, agent_id: str) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9_-]+", "-", agent_id).strip("-") or "agent"
+        return sanitized[:40]
+
+    def _session_target(self, agent_id: str) -> str:
+        return f"{self._session_name(agent_id)}:0"
+
+    def ensure_tmux_session(
+        self,
+        *,
+        agent_id: str,
+        shell_command: str,
+    ) -> tuple[str, str]:
         session_name = self._session_name(agent_id)
         exists = subprocess.run(
             ["tmux", "has-session", "-t", session_name],
@@ -81,12 +93,32 @@ class CodexExecManager:
             check=False,
         )
         if exists.returncode == 0:
-            return session_name
-        subprocess.run(
-            ["tmux", "new-session", "-d", "-s", session_name, "-n", "mailbridge", "sleep infinity"],
+            pane_id = self._session_pane_id(agent_id)
+            if pane_id:
+                return session_name, pane_id
+            self.kill_agent_session(agent_id)
+        proc = subprocess.run(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-s",
+                session_name,
+                "-n",
+                self._window_name(agent_id),
+                shell_command,
+            ],
+            capture_output=True,
+            text=True,
             check=True,
         )
-        return session_name
+        pane_id = proc.stdout.strip()
+        if not pane_id:
+            raise RuntimeError("tmux did not return a pane id")
+        return session_name, pane_id
 
     def start_turn(
         self,
@@ -98,44 +130,26 @@ class CodexExecManager:
         image_paths: list[str],
         resume_session_id: str | None,
     ) -> StartedTurn:
-        session_name = self.ensure_tmux_session(agent_id)
-        window_name = self._window_name(agent_id, pending_turn_id)
         session_path = self._session_path_for_id(resume_session_id) if resume_session_id else None
         if resume_session_id and session_path is None:
             raise RuntimeError(f"Could not locate Codex session file for {resume_session_id}")
 
-        launched_at = time.time()
         shell_command = self._build_shell_command(
             workspace=workspace,
             image_paths=image_paths,
             resume_session_id=resume_session_id,
         )
-        proc = subprocess.run(
-            [
-                "tmux",
-                "new-window",
-                "-d",
-                "-P",
-                "-F",
-                "#{window_id} #{pane_id}",
-                "-t",
-                session_name,
-                "-n",
-                window_name,
-                shell_command,
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        output = proc.stdout.strip().split()
-        if len(output) != 2:
-            raise RuntimeError("tmux did not return a window id and pane id")
-        window_id, pane_id = output
-        if not pane_id:
-            raise RuntimeError("tmux did not return a pane id")
+        existing_pane_id = self._session_pane_id(agent_id)
+        pane_started_fresh = existing_pane_id is None or not self.pane_running_codex(existing_pane_id)
+        if existing_pane_id and not self.pane_running_codex(existing_pane_id):
+            self.kill_agent_session(agent_id)
+            existing_pane_id = None
 
-        self._wait_for_codex_ready(pane_id)
+        launched_at = time.time()
+        session_name, pane_id = self.ensure_tmux_session(agent_id=agent_id, shell_command=shell_command)
+        if pane_started_fresh:
+            self._wait_for_codex_ready(pane_id)
+
         turn_id: str | None = None
         if session_path is None:
             self._send_prompt(pane_id, prompt)
@@ -148,7 +162,7 @@ class CodexExecManager:
             turn_id = self._wait_for_turn_id(session_path, pre_submit_size)
 
         if not self._session_has_attached_clients(session_name):
-            subprocess.run(["tmux", "select-window", "-t", window_id], check=False)
+            subprocess.run(["tmux", "select-window", "-t", self._session_target(agent_id)], check=False)
         return StartedTurn(
             pane_id=pane_id,
             log_path=str(session_path),
@@ -468,10 +482,6 @@ class CodexExecManager:
     def _submit_prompt(self, pane_id: str) -> None:
         subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-m"], check=False)
 
-    def _window_name(self, agent_id: str, pending_turn_id: int) -> str:
-        sanitized = re.sub(r"[^A-Za-z0-9_-]+", "-", agent_id).strip("-") or "agent"
-        return f"{pending_turn_id}-{sanitized[:40]}"
-
     def _session_has_attached_clients(self, session_name: str) -> bool:
         result = subprocess.run(
             ["tmux", "display-message", "-p", "-t", session_name, "#{session_attached}"],
@@ -483,3 +493,15 @@ class CodexExecManager:
             return False
         attached = result.stdout.strip()
         return attached not in {"", "0"}
+
+    def _session_pane_id(self, agent_id: str) -> str | None:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", self._session_target(agent_id), "#{pane_id}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        pane_id = result.stdout.strip()
+        if result.returncode != 0 or not pane_id:
+            return None
+        return pane_id

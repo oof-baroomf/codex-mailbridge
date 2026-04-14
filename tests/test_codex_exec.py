@@ -240,3 +240,37 @@ def test_wait_for_new_session_resubmits_idle_prompt_once(tmp_path: Path, monkeyp
     assert found_path == session_path
     assert session_id == "session-123"
     assert state["submitted"] == 1
+
+
+def test_start_turn_reuses_existing_live_agent_pane(tmp_path: Path, monkeypatch) -> None:
+    manager = CodexExecManager(_config())
+    session_path = tmp_path / "session.jsonl"
+    session_path.write_text('{"type":"session_meta","payload":{"id":"session-123","cwd":"/tmp/work"}}\n', encoding="utf-8")
+    sent_prompts: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(manager, "_session_pane_id", lambda agent_id: "%9")
+    monkeypatch.setattr(manager, "pane_running_codex", lambda pane_id: pane_id == "%9")
+    monkeypatch.setattr(
+        manager,
+        "ensure_tmux_session",
+        lambda *, agent_id, shell_command: (manager._session_name(agent_id), "%9"),
+    )
+    monkeypatch.setattr(manager, "_session_path_for_id", lambda session_id: session_path)
+    monkeypatch.setattr(manager, "_send_prompt", lambda pane_id, prompt: sent_prompts.append((pane_id, prompt)))
+    monkeypatch.setattr(manager, "_wait_for_turn_id", lambda path, start_size: "turn-456")
+    monkeypatch.setattr(manager, "_session_has_attached_clients", lambda session_name: True)
+
+    started = manager.start_turn(
+        agent_id="some questions",
+        workspace=Path("/tmp/work"),
+        pending_turn_id=12,
+        prompt="continue",
+        image_paths=[],
+        resume_session_id="session-123",
+    )
+
+    assert started.pane_id == "%9"
+    assert started.log_path == str(session_path)
+    assert started.thread_id == "session-123"
+    assert started.turn_id == "turn-456"
+    assert sent_prompts == [("%9", "continue")]

@@ -226,7 +226,6 @@ class MailBridgeDaemon:
                 if _is_end_command(body_text):
                     self._handle_end_command(thread, msg.rfc_message_id)
                     return
-                self._supersede_pending_turns(thread)
 
         attachment_paths, image_paths = save_attachments(workspace, msg.attachments)
         if not body_text.strip():
@@ -278,16 +277,6 @@ class MailBridgeDaemon:
         thread = self.db.get_thread_by_agent(agent_id)
         assert thread is not None
         return thread
-
-    def _supersede_pending_turns(self, thread: ThreadRecord) -> None:
-        queued_ids: list[int] = []
-        for pending in self.db.pending_turns_for_agent(thread.agent_id):
-            if pending.status == "queued":
-                queued_ids.append(pending.id)
-                continue
-            if pending.runner_pane_id:
-                self.exec.interrupt_turn(pending.runner_pane_id)
-        self.db.delete_pending_turns(queued_ids)
 
     def _start_queued_turns(self) -> None:
         for thread in self.db.tracked_threads():

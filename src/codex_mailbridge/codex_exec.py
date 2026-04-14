@@ -259,7 +259,8 @@ class CodexExecManager:
                 continue
 
             if payload_type == "agent_message":
-                text = str(payload.get("message", "")).strip()
+                raw_message = payload.get("message")
+                text = raw_message.strip() if isinstance(raw_message, str) else ""
                 if not text:
                     continue
                 if not state.first_agent_text:
@@ -271,7 +272,8 @@ class CodexExecManager:
                 completed_turn_id = str(payload.get("turn_id", "")).strip()
                 if target_turn_id and completed_turn_id != target_turn_id:
                     continue
-                last_message = str(payload.get("last_agent_message", "")).strip()
+                raw_last_message = payload.get("last_agent_message")
+                last_message = raw_last_message.strip() if isinstance(raw_last_message, str) else ""
                 if last_message:
                     if not state.first_agent_text:
                         state.first_agent_text = last_message

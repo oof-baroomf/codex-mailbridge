@@ -293,6 +293,30 @@ def test_sync_pending_turn_sends_progress_and_final_reply() -> None:
     assert [call["markdown_body"] for call in daemon.gmail.calls] == ["working", "done"]
 
 
+def test_sync_pending_turn_completed_without_final_message_uses_error_reply() -> None:
+    daemon = object.__new__(MailBridgeDaemon)
+    daemon.db = _SyncDB()
+    daemon.gmail = _FakeGmail()
+    daemon.exec = _FakeExec()
+    daemon.exec.state = ExecTurnState(
+        errors=["Selected model is at capacity. Please try a different model."],
+        turn_completed=True,
+        exit_code=0,
+    )
+
+    daemon._sync_pending_turn(daemon.db.thread, _pending())
+
+    assert daemon.db.finished == [(1, "Selected model is at capacity. Please try a different model.")]
+    assert daemon.gmail.calls == [
+        {
+            "subject": "Re: subject",
+            "markdown_body": "Codex error:\n\nSelected model is at capacity. Please try a different model.",
+            "parent_message_id": "<reply@msg>",
+            "references": ["<last@msg>"],
+        }
+    ]
+
+
 def test_sync_pending_turn_emails_failure() -> None:
     daemon = object.__new__(MailBridgeDaemon)
     daemon.db = _SyncDB()

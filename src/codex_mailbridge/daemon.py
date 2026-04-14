@@ -337,9 +337,17 @@ class MailBridgeDaemon:
             self._send_turn_progress_reply(thread, pending, state.first_agent_text)
 
         if state.turn_completed:
-            self.db.mark_turn_finished(pending.id, None)
-            if state.last_agent_text and not self.db.turn_email_exists(turn_key, "assistant_reply"):
-                self._send_turn_reply(thread, pending, state.last_agent_text)
+            if state.last_agent_text:
+                self.db.mark_turn_finished(pending.id, None)
+                if not self.db.turn_email_exists(turn_key, "assistant_reply"):
+                    self._send_turn_reply(thread, pending, state.last_agent_text)
+            elif state.errors:
+                error_text = state.failure_text()
+                self.db.mark_turn_finished(pending.id, error_text)
+                if not self.db.turn_email_exists(turn_key, "assistant_reply"):
+                    self._send_turn_reply(thread, pending, _format_turn_failure(error_text))
+            else:
+                self._fail_pending_turn(thread, pending, "Codex completed without a final response.")
             return
 
         if state.turn_failed or (state.exit_code is not None and state.exit_code != 0):

@@ -131,6 +131,29 @@ def test_read_turn_state_ignores_older_turns_in_same_session(tmp_path: Path) -> 
     assert state.turn_completed is False
 
 
+def test_read_turn_state_keeps_null_task_complete_message_empty(tmp_path: Path) -> None:
+    log_path = tmp_path / "turn.jsonl"
+    log_path.write_text(
+        "\n".join(
+            [
+                '{"type":"session_meta","payload":{"id":"session-123","cwd":"/tmp/work"}}',
+                '{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}',
+                '{"type":"event_msg","payload":{"type":"error","message":"Selected model is at capacity. Please try a different model."}}',
+                '{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":null}}',
+            ]
+        )
+        + "\n"
+    )
+    manager = CodexExecManager(_config())
+
+    state = manager.read_turn_state(str(log_path), "turn-1")
+
+    assert state.thread_id == "session-123"
+    assert state.last_agent_text == ""
+    assert state.turn_completed is True
+    assert state.errors == ["Selected model is at capacity. Please try a different model."]
+
+
 def test_session_path_for_id_uses_filename_match(tmp_path: Path, monkeypatch) -> None:
     session_root = tmp_path / "sessions"
     session_root.mkdir(parents=True)

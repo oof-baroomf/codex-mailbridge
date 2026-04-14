@@ -206,6 +206,8 @@ class MailBridgeDaemon:
 
     def _handle_incoming(self, msg: IncomingMail) -> None:
         body_text = _extract_latest_reply_text(msg.body_text)
+        attachment_paths: list[str] | None = None
+        image_paths: list[str] | None = None
         thread = self.db.get_thread_by_gmail_thread(msg.gmail_thread_id)
         if thread is None:
             raw_path, agent_id = parse_subject(msg.subject)
@@ -226,8 +228,24 @@ class MailBridgeDaemon:
                 if _is_end_command(body_text):
                     self._handle_end_command(thread, msg.rfc_message_id)
                     return
+                attachment_paths, image_paths = save_attachments(workspace, msg.attachments)
+                running = self.db.pending_turns_for_agent(thread.agent_id, statuses=("running",))
+                live_pending = next(
+                    (
+                        pending
+                        for pending in reversed(running)
+                        if pending.runner_pane_id and self.exec.pane_running_codex(pending.runner_pane_id)
+                    ),
+                    None,
+                )
+                if live_pending is not None:
+                    self.exec.send_prompt(live_pending.runner_pane_id, body_text)
+                    self.db.update_turn_reply_to_message_id(live_pending.id, msg.rfc_message_id)
+                    return
+                self.db.delete_pending_turns([pending.id for pending in self.db.pending_turns_for_agent(thread.agent_id, statuses=("queued",))])
 
-        attachment_paths, image_paths = save_attachments(workspace, msg.attachments)
+        if attachment_paths is None or image_paths is None:
+            attachment_paths, image_paths = save_attachments(workspace, msg.attachments)
         if not body_text.strip():
             return
         assert thread is not None

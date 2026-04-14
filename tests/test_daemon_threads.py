@@ -6,6 +6,7 @@ from codex_mailbridge.db import PendingTurn
 class _FakeExec:
     def __init__(self) -> None:
         self.interrupted: list[str] = []
+        self.sent_prompts: list[tuple[str, str]] = []
         self.started: list[dict] = []
         self.state = ExecTurnState()
         self.live_panes: set[str] = set()
@@ -13,6 +14,9 @@ class _FakeExec:
 
     def interrupt_turn(self, pane_id: str) -> None:
         self.interrupted.append(pane_id)
+
+    def send_prompt(self, pane_id: str, prompt: str) -> None:
+        self.sent_prompts.append((pane_id, prompt))
 
     def start_turn(self, **kwargs) -> StartedTurn:
         self.started.append(kwargs)
@@ -45,6 +49,8 @@ class _FakeGmail:
 class _QueueDB:
     def __init__(self) -> None:
         self.enqueued: list[dict] = []
+        self.updated_reply_to: list[tuple[int, str | None]] = []
+        self.deleted: list[int] = []
         self.thread = type(
             "Thread",
             (),
@@ -61,8 +67,45 @@ class _QueueDB:
     def get_thread_by_gmail_thread(self, gmail_thread_id: str):
         return self.thread
 
+    def pending_turns_for_agent(self, agent_id: str, statuses=("queued", "running")):
+        turns = [
+            PendingTurn(
+                id=2,
+                agent_id=agent_id,
+                gmail_message_id="m2",
+                reply_to_message_id="<old@msg>",
+                text_body="running",
+                image_paths=[],
+                attachment_paths=[],
+                status="running",
+                codex_turn_id="turn-2",
+                runner_pane_id="%2",
+                runner_log_path="/tmp/2.jsonl",
+            ),
+            PendingTurn(
+                id=3,
+                agent_id=agent_id,
+                gmail_message_id="m3",
+                reply_to_message_id=None,
+                text_body="queued",
+                image_paths=[],
+                attachment_paths=[],
+                status="queued",
+                codex_turn_id=None,
+                runner_pane_id=None,
+                runner_log_path=None,
+            ),
+        ]
+        return [turn for turn in turns if turn.status in statuses]
+
     def enqueue_turn(self, **kwargs) -> None:
         self.enqueued.append(kwargs)
+
+    def update_turn_reply_to_message_id(self, pending_turn_id: int, reply_to_message_id: str | None) -> None:
+        self.updated_reply_to.append((pending_turn_id, reply_to_message_id))
+
+    def delete_pending_turns(self, pending_turn_ids: list[int]) -> None:
+        self.deleted = pending_turn_ids
 
 
 def test_handle_incoming_running_thread_enqueues_without_interrupting(monkeypatch) -> None:
@@ -71,12 +114,13 @@ def test_handle_incoming_running_thread_enqueues_without_interrupting(monkeypatc
     daemon = object.__new__(MailBridgeDaemon)
     daemon.db = _QueueDB()
     daemon.exec = _FakeExec()
+    daemon.exec.live_panes.add("%2")
     monkeypatch.setattr("codex_mailbridge.daemon.save_attachments", lambda workspace, attachments: ([], []))
 
     daemon._handle_incoming(
         IncomingMail(
             uid="1",
-            gmail_message_id="m3",
+            gmail_message_id="m4",
             gmail_thread_id="g1",
             rfc_message_id="<reply@msg>",
             subject="Re: subject",
@@ -88,16 +132,10 @@ def test_handle_incoming_running_thread_enqueues_without_interrupting(monkeypatc
     )
 
     assert daemon.exec.interrupted == []
-    assert daemon.db.enqueued == [
-        {
-            "agent_id": "agent-1",
-            "gmail_message_id": "m3",
-            "reply_to_message_id": "<reply@msg>",
-            "text_body": "new request",
-            "image_paths": [],
-            "attachment_paths": [],
-        }
-    ]
+    assert daemon.exec.sent_prompts == [("%2", "new request")]
+    assert daemon.db.updated_reply_to == [(2, "<reply@msg>")]
+    assert daemon.db.enqueued == []
+    assert daemon.db.deleted == []
 
 
 class _EndDB:

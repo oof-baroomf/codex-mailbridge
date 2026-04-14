@@ -173,6 +173,9 @@ class CodexExecManager:
     def interrupt_turn(self, pane_id: str) -> None:
         subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-c"], check=False)
 
+    def send_prompt(self, pane_id: str, prompt: str) -> None:
+        self._send_prompt(pane_id, prompt)
+
     def kill_agent_session(self, agent_id: str) -> None:
         session_name = self._session_name(agent_id)
         subprocess.run(["tmux", "kill-session", "-t", session_name], check=False)

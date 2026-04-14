@@ -224,6 +224,13 @@ class StateDB:
         )
         self.conn.commit()
 
+    def update_turn_reply_to_message_id(self, pending_turn_id: int, reply_to_message_id: str | None) -> None:
+        self.conn.execute(
+            "UPDATE pending_turns SET reply_to_message_id = ? WHERE id = ?",
+            (reply_to_message_id, pending_turn_id),
+        )
+        self.conn.commit()
+
     def enqueue_turn(
         self,
         *,

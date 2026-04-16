@@ -40,6 +40,9 @@ class _FakeExec:
     def pane_running_codex(self, pane_id: str) -> bool:
         return pane_id in self.live_panes
 
+    def pane_ready_for_input(self, pane_id: str) -> bool:
+        return pane_id in self.live_panes
+
     def kill_agent_session(self, agent_id: str) -> None:
         self.killed_sessions.append(agent_id)
 
@@ -422,6 +425,7 @@ class _SyncDB:
         self.recorded: list[tuple[str, str, str]] = []
         self.updated_email: list[tuple[str, str]] = []
         self.updated_thread_ids: list[tuple[str, str]] = []
+        self.submitted: list[tuple[int, str | None, str | None]] = []
         self.thread = type(
             "Thread",
             (),
@@ -444,6 +448,9 @@ class _SyncDB:
 
     def mark_turn_finished(self, pending_turn_id: int, error: str | None = None) -> None:
         self.finished.append((pending_turn_id, error))
+
+    def mark_turn_submitted(self, pending_turn_id: int, *, runner_pane_id: str | None = None, runner_log_path: str | None = None) -> None:
+        self.submitted.append((pending_turn_id, runner_pane_id, runner_log_path))
 
     def turn_email_exists(self, turn_id: str, kind: str) -> bool:
         return any(recorded_turn_id == turn_id and recorded_kind == kind for recorded_turn_id, recorded_kind, _ in self.recorded)
@@ -573,6 +580,66 @@ def test_sync_pending_turn_marks_missing_codex_process_as_failure() -> None:
             "references": ["<last@msg>"],
         }
     ]
+
+
+def test_sync_submitted_turn_resends_idle_prompt_after_timeout(monkeypatch) -> None:
+    daemon = object.__new__(MailBridgeDaemon)
+    daemon.db = _SyncDB()
+    daemon.gmail = _FakeGmail()
+    daemon.exec = _FakeExec()
+    daemon.exec.live_panes.add("%1")
+
+    pending = PendingTurn(
+        id=5,
+        agent_id="agent-1",
+        gmail_message_id="m5",
+        reply_to_message_id="<reply@msg>",
+        text_body="continue with the next step",
+        image_paths=[],
+        attachment_paths=[],
+        status="submitted",
+        codex_turn_id=None,
+        started_at=100,
+        runner_pane_id="%1",
+        runner_log_path="/tmp/turn.jsonl",
+    )
+
+    monkeypatch.setattr("codex_mailbridge.daemon.time.time", lambda: 116)
+
+    daemon._sync_submitted_turn(daemon.db.thread, pending)
+
+    assert daemon.exec.sent_prompts == [("%1", "continue with the next step")]
+    assert daemon.db.submitted == [(5, "%1", "/tmp/turn.jsonl")]
+
+
+def test_sync_submitted_turn_does_not_resend_before_timeout(monkeypatch) -> None:
+    daemon = object.__new__(MailBridgeDaemon)
+    daemon.db = _SyncDB()
+    daemon.gmail = _FakeGmail()
+    daemon.exec = _FakeExec()
+    daemon.exec.live_panes.add("%1")
+
+    pending = PendingTurn(
+        id=5,
+        agent_id="agent-1",
+        gmail_message_id="m5",
+        reply_to_message_id="<reply@msg>",
+        text_body="continue with the next step",
+        image_paths=[],
+        attachment_paths=[],
+        status="submitted",
+        codex_turn_id=None,
+        started_at=100,
+        runner_pane_id="%1",
+        runner_log_path="/tmp/turn.jsonl",
+    )
+
+    monkeypatch.setattr("codex_mailbridge.daemon.time.time", lambda: 110)
+
+    daemon._sync_submitted_turn(daemon.db.thread, pending)
+
+    assert daemon.exec.sent_prompts == []
+    assert daemon.db.submitted == []
 
 
 def test_handle_end_command_interrupts_running_turns_kills_session_and_acks() -> None:

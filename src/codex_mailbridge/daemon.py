@@ -19,6 +19,7 @@ NOTES_DIR = Path("/home/d/notes").resolve()
 DAEMON_TICK_SECONDS = 1.0
 SHELL_COMMAND_TIMEOUT_SECONDS = 120
 SHELL_COMMAND_OUTPUT_LIMIT = 20_000
+SUBMITTED_TURN_RETRY_SECONDS = 15
 
 
 class SubjectParseError(RuntimeError):
@@ -474,6 +475,19 @@ class MailBridgeDaemon:
             return
         if pending.runner_pane_id and not self.exec.pane_running_codex(pending.runner_pane_id):
             self._fail_pending_turn(thread, pending, "Codex exited before handling the injected email.")
+            return
+        if (
+            pending.runner_pane_id
+            and pending.started_at is not None
+            and time.time() - pending.started_at >= SUBMITTED_TURN_RETRY_SECONDS
+            and self.exec.pane_ready_for_input(pending.runner_pane_id)
+        ):
+            self.exec.send_prompt(pending.runner_pane_id, pending.text_body)
+            self.db.mark_turn_submitted(
+                pending.id,
+                runner_pane_id=pending.runner_pane_id,
+                runner_log_path=pending.runner_log_path,
+            )
 
     def _sync_pending_turn(self, thread: ThreadRecord, pending: PendingTurn) -> None:
         state = self.exec.read_turn_state(pending.runner_log_path, pending.codex_turn_id)

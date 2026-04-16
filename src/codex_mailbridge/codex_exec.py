@@ -177,6 +177,12 @@ class CodexExecManager:
     def send_prompt(self, pane_id: str, prompt: str) -> None:
         self._send_prompt(pane_id, prompt)
 
+    def pane_ready_for_input(self, pane_id: str) -> bool:
+        if not self.pane_exists(pane_id):
+            return False
+        pane_text = self._capture_pane(pane_id)
+        return self._pane_text_indicates_ready(pane_text) and not self._pane_text_indicates_working(pane_text)
+
     def kill_agent_session(self, agent_id: str) -> None:
         session_name = self._session_name(agent_id)
         subprocess.run(["tmux", "kill-session", "-t", session_name], check=False)

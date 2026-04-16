@@ -1,3 +1,6 @@
+import subprocess
+from pathlib import Path
+
 from codex_mailbridge.codex_exec import ExecTurnState, StartedTurn
 from codex_mailbridge.daemon import MailBridgeDaemon, _split_reply_commands
 from codex_mailbridge.db import PendingTurn
@@ -256,6 +259,32 @@ def test_handle_incoming_command_only_reply_skips_codex(monkeypatch) -> None:
             "references": ["<last@msg>"],
         }
     ]
+
+
+def test_run_shell_command_timeout_decodes_partial_bytes(monkeypatch, tmp_path: Path) -> None:
+    daemon = object.__new__(MailBridgeDaemon)
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=["bash", "-lc", "ping google.com"],
+            timeout=120,
+            output=b"PONG\n",
+            stderr=b"warning\n",
+        )
+
+    monkeypatch.setattr("codex_mailbridge.daemon.subprocess.run", fake_run)
+
+    output, exit_code = daemon._run_shell_command(tmp_path, "ping google.com")
+
+    assert output == (
+        "$ ping google.com\n\n"
+        "[stdout]\n"
+        "PONG\n\n"
+        "[stderr]\n"
+        "warning\n\n"
+        "[timed out after 120s]"
+    )
+    assert exit_code is None
 
 
 class _EndDB:

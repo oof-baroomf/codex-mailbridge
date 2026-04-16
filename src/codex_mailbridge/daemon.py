@@ -207,8 +207,8 @@ class MailBridgeDaemon:
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
+            stdout = self._coerce_shell_output(exc.stdout)
+            stderr = self._coerce_shell_output(exc.stderr)
             combined = self._format_shell_command_output(
                 command=command,
                 stdout=stdout,
@@ -226,17 +226,24 @@ class MailBridgeDaemon:
         )
         return output, proc.returncode
 
+    def _coerce_shell_output(self, output: str | bytes | None) -> str:
+        if output is None:
+            return ""
+        if isinstance(output, bytes):
+            return output.decode("utf-8", errors="replace")
+        return output
+
     def _format_shell_command_output(
         self,
         *,
         command: str,
-        stdout: str,
-        stderr: str,
+        stdout: str | bytes | None,
+        stderr: str | bytes | None,
         exit_code: int | None,
         timeout_seconds: int | None,
     ) -> str:
-        stdout = self._truncate_shell_output(stdout)
-        stderr = self._truncate_shell_output(stderr)
+        stdout = self._truncate_shell_output(self._coerce_shell_output(stdout))
+        stderr = self._truncate_shell_output(self._coerce_shell_output(stderr))
         lines = [f"$ {command}"]
         if stdout:
             lines.extend(["", "[stdout]", stdout])

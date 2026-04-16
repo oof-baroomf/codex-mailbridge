@@ -5,6 +5,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import re
 import shlex
+import subprocess
 import time
 
 from .codex_exec import CodexExecManager
@@ -16,6 +17,8 @@ from .emailer import GmailClient, IncomingMail, email_addresses_match, save_atta
 LOG = logging.getLogger(__name__)
 NOTES_DIR = Path("/home/d/notes").resolve()
 DAEMON_TICK_SECONDS = 1.0
+SHELL_COMMAND_TIMEOUT_SECONDS = 120
+SHELL_COMMAND_OUTPUT_LIMIT = 20_000
 
 
 class SubjectParseError(RuntimeError):
@@ -88,6 +91,24 @@ def _extract_latest_reply_text(body: str) -> str:
 
 def _format_turn_failure(error_text: str) -> str:
     return f"Codex error:\n\n{error_text.strip()}"
+
+
+def _split_reply_commands(body_text: str) -> tuple[str, list[str]]:
+    prompt_lines: list[str] = []
+    shell_commands: list[str] = []
+    for raw_line in body_text.split("\n"):
+        line = raw_line.rstrip()
+        stripped = line.lstrip()
+        if stripped.startswith("!"):
+            command = stripped[1:].strip()
+            if command:
+                shell_commands.append(command)
+            continue
+        prompt_lines.append(line)
+    prompt_text = "\n".join(prompt_lines)
+    prompt_text = re.sub(r"[ \t]+\n", "\n", prompt_text)
+    prompt_text = re.sub(r"\n{3,}", "\n\n", prompt_text)
+    return prompt_text.strip(), shell_commands
 
 
 def _is_end_command(body_text: str) -> bool:
@@ -175,6 +196,80 @@ class MailBridgeDaemon:
         if not self.db.turn_email_exists(self._turn_key(pending), "assistant_reply"):
             self._send_turn_reply(thread, pending, _format_turn_failure(error_text))
 
+    def _run_shell_command(self, workspace: Path, command: str) -> tuple[str, int | None]:
+        try:
+            proc = subprocess.run(
+                ["bash", "-lc", command],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=SHELL_COMMAND_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            combined = self._format_shell_command_output(
+                command=command,
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=None,
+                timeout_seconds=SHELL_COMMAND_TIMEOUT_SECONDS,
+            )
+            return combined, None
+        output = self._format_shell_command_output(
+            command=command,
+            stdout=proc.stdout,
+            stderr=proc.stderr,
+            exit_code=proc.returncode,
+            timeout_seconds=None,
+        )
+        return output, proc.returncode
+
+    def _format_shell_command_output(
+        self,
+        *,
+        command: str,
+        stdout: str,
+        stderr: str,
+        exit_code: int | None,
+        timeout_seconds: int | None,
+    ) -> str:
+        stdout = self._truncate_shell_output(stdout)
+        stderr = self._truncate_shell_output(stderr)
+        lines = [f"$ {command}"]
+        if stdout:
+            lines.extend(["", "[stdout]", stdout])
+        if stderr:
+            lines.extend(["", "[stderr]", stderr])
+        if not stdout and not stderr:
+            lines.extend(["", "[no output]"])
+        if timeout_seconds is not None:
+            lines.extend(["", f"[timed out after {timeout_seconds}s]"])
+        elif exit_code is not None:
+            lines.extend(["", f"[exit {exit_code}]"])
+        return "\n".join(lines)
+
+    def _truncate_shell_output(self, text: str) -> str:
+        text = text.strip()
+        if len(text) <= SHELL_COMMAND_OUTPUT_LIMIT:
+            return text
+        omitted = len(text) - SHELL_COMMAND_OUTPUT_LIMIT
+        return f"{text[:SHELL_COMMAND_OUTPUT_LIMIT].rstrip()}\n\n[truncated {omitted} characters]"
+
+    def _send_shell_command_reply(
+        self,
+        thread: ThreadRecord,
+        parent_message_id: str | None,
+        workspace: Path,
+        shell_commands: list[str],
+    ) -> None:
+        blocks = [f"Shell command output from `{workspace}`:"]
+        for command in shell_commands:
+            output, _ = self._run_shell_command(workspace, command)
+            blocks.extend(["", "```text", output, "```"])
+        self._send_thread_reply(thread, parent_message_id, "\n".join(blocks))
+
     def _poll_inbox(self) -> None:
         if not self.config.gmail.configured:
             if not self.auth_warning_logged:
@@ -206,13 +301,15 @@ class MailBridgeDaemon:
 
     def _handle_incoming(self, msg: IncomingMail) -> None:
         body_text = _extract_latest_reply_text(msg.body_text)
+        prompt_text, shell_commands = _split_reply_commands(body_text)
         attachment_paths: list[str] | None = None
         image_paths: list[str] | None = None
+        shell_commands_sent = False
         thread = self.db.get_thread_by_gmail_thread(msg.gmail_thread_id)
         if thread is None:
             raw_path, agent_id = parse_subject(msg.subject)
             workspace = normalize_workspace_path(raw_path)
-            if body_text.strip():
+            if prompt_text or shell_commands:
                 if self.db.get_thread_by_agent(agent_id) is not None:
                     raise SubjectParseError(f"Agent id '{agent_id}' has already been used")
                 thread = self._create_thread(
@@ -224,48 +321,56 @@ class MailBridgeDaemon:
                 )
         else:
             workspace = Path(thread.workspace_path)
-            if body_text.strip():
-                if _is_end_command(body_text):
+            if prompt_text or shell_commands:
+                if not shell_commands and _is_end_command(prompt_text):
                     self._handle_end_command(thread, msg.rfc_message_id)
                     return
                 attachment_paths, image_paths = save_attachments(workspace, msg.attachments)
-                running = self.db.pending_turns_for_agent(thread.agent_id, statuses=("running",))
-                live_pending = next(
-                    (
-                        pending
-                        for pending in reversed(running)
-                        if pending.runner_pane_id and self.exec.pane_running_codex(pending.runner_pane_id)
-                    ),
-                    None,
-                )
-                if live_pending is not None:
-                    pending_turn_id = self.db.enqueue_turn(
-                        agent_id=thread.agent_id,
-                        gmail_message_id=msg.gmail_message_id,
-                        reply_to_message_id=msg.rfc_message_id,
-                        text_body=body_text,
-                        image_paths=image_paths,
-                        attachment_paths=attachment_paths,
+                if shell_commands:
+                    self._send_shell_command_reply(thread, msg.rfc_message_id, workspace, shell_commands)
+                    shell_commands_sent = True
+                if prompt_text:
+                    running = self.db.pending_turns_for_agent(thread.agent_id, statuses=("running",))
+                    live_pending = next(
+                        (
+                            pending
+                            for pending in reversed(running)
+                            if pending.runner_pane_id and self.exec.pane_running_codex(pending.runner_pane_id)
+                        ),
+                        None,
                     )
-                    self.exec.send_prompt(live_pending.runner_pane_id, body_text)
-                    self.db.mark_turn_submitted(
-                        pending_turn_id,
-                        runner_pane_id=live_pending.runner_pane_id,
-                        runner_log_path=live_pending.runner_log_path,
-                    )
+                    if live_pending is not None:
+                        pending_turn_id = self.db.enqueue_turn(
+                            agent_id=thread.agent_id,
+                            gmail_message_id=msg.gmail_message_id,
+                            reply_to_message_id=msg.rfc_message_id,
+                            text_body=prompt_text,
+                            image_paths=image_paths,
+                            attachment_paths=attachment_paths,
+                        )
+                        self.exec.send_prompt(live_pending.runner_pane_id, prompt_text)
+                        self.db.mark_turn_submitted(
+                            pending_turn_id,
+                            runner_pane_id=live_pending.runner_pane_id,
+                            runner_log_path=live_pending.runner_log_path,
+                        )
+                        return
+                    self.db.delete_pending_turns([pending.id for pending in self.db.pending_turns_for_agent(thread.agent_id, statuses=("queued",))])
+                else:
                     return
-                self.db.delete_pending_turns([pending.id for pending in self.db.pending_turns_for_agent(thread.agent_id, statuses=("queued",))])
 
         if attachment_paths is None or image_paths is None:
             attachment_paths, image_paths = save_attachments(workspace, msg.attachments)
-        if not body_text.strip():
+        if shell_commands and thread is not None and not shell_commands_sent:
+            self._send_shell_command_reply(thread, msg.rfc_message_id, workspace, shell_commands)
+        if not prompt_text:
             return
         assert thread is not None
         self.db.enqueue_turn(
             agent_id=thread.agent_id,
             gmail_message_id=msg.gmail_message_id,
             reply_to_message_id=msg.rfc_message_id,
-            text_body=body_text,
+            text_body=prompt_text,
             image_paths=image_paths,
             attachment_paths=attachment_paths,
         )

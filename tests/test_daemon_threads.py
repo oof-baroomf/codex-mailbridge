@@ -1,5 +1,5 @@
 from codex_mailbridge.codex_exec import ExecTurnState, StartedTurn
-from codex_mailbridge.daemon import MailBridgeDaemon
+from codex_mailbridge.daemon import MailBridgeDaemon, _split_reply_commands
 from codex_mailbridge.db import PendingTurn
 
 
@@ -54,6 +54,7 @@ class _QueueDB:
         self.enqueued: list[dict] = []
         self.submitted: list[tuple[int, str | None, str | None]] = []
         self.updated_reply_to: list[tuple[int, str | None]] = []
+        self.updated_email: list[tuple[str, str]] = []
         self.deleted: list[int] = []
         self.thread = type(
             "Thread",
@@ -69,6 +70,9 @@ class _QueueDB:
         )()
 
     def get_thread_by_gmail_thread(self, gmail_thread_id: str):
+        return self.thread
+
+    def get_thread_by_agent(self, agent_id: str):
         return self.thread
 
     def pending_turns_for_agent(self, agent_id: str, statuses=("queued", "running")):
@@ -117,6 +121,17 @@ class _QueueDB:
     def delete_pending_turns(self, pending_turn_ids: list[int]) -> None:
         self.deleted = pending_turn_ids
 
+    def update_last_email_message_id(self, agent_id: str, message_id: str) -> None:
+        self.updated_email.append((agent_id, message_id))
+        self.thread.last_email_message_id = message_id
+
+
+def test_split_reply_commands_separates_shell_lines() -> None:
+    prompt_text, shell_commands = _split_reply_commands("first line\n  ! pwd\n\nsecond line\n! ls -1\n")
+
+    assert prompt_text == "first line\n\nsecond line"
+    assert shell_commands == ["pwd", "ls -1"]
+
 
 def test_handle_incoming_running_thread_injects_without_interrupting(monkeypatch) -> None:
     from codex_mailbridge.daemon import IncomingMail
@@ -156,6 +171,91 @@ def test_handle_incoming_running_thread_injects_without_interrupting(monkeypatch
     assert daemon.db.submitted == [(4, "%2", "/tmp/2.jsonl")]
     assert daemon.db.updated_reply_to == []
     assert daemon.db.deleted == []
+
+
+def test_handle_incoming_running_thread_executes_shell_lines_and_sends_trimmed_prompt(monkeypatch) -> None:
+    from codex_mailbridge.daemon import IncomingMail
+
+    daemon = object.__new__(MailBridgeDaemon)
+    daemon.db = _QueueDB()
+    daemon.gmail = _FakeGmail()
+    daemon.exec = _FakeExec()
+    daemon.exec.live_panes.add("%2")
+    daemon._run_shell_command = lambda workspace, command: (f"$ {command}\n\n[stdout]\nok\n\n[exit 0]", 0)
+    monkeypatch.setattr("codex_mailbridge.daemon.save_attachments", lambda workspace, attachments: ([], []))
+
+    daemon._handle_incoming(
+        IncomingMail(
+            uid="1",
+            gmail_message_id="m4",
+            gmail_thread_id="g1",
+            rfc_message_id="<reply@msg>",
+            subject="Re: subject",
+            from_address="user@example.com",
+            body_text="Please check this\n! pwd\n! git status --short",
+            attachments=[],
+            references=[],
+        )
+    )
+
+    assert daemon.exec.sent_prompts == [("%2", "Please check this")]
+    assert daemon.db.enqueued == [
+        {
+            "agent_id": "agent-1",
+            "gmail_message_id": "m4",
+            "reply_to_message_id": "<reply@msg>",
+            "text_body": "Please check this",
+            "image_paths": [],
+            "attachment_paths": [],
+        }
+    ]
+    assert daemon.gmail.calls == [
+        {
+            "subject": "Re: subject",
+            "markdown_body": "Shell command output from `/tmp/work`:\n\n```text\n$ pwd\n\n[stdout]\nok\n\n[exit 0]\n```\n\n```text\n$ git status --short\n\n[stdout]\nok\n\n[exit 0]\n```",
+            "parent_message_id": "<reply@msg>",
+            "references": ["<last@msg>"],
+        }
+    ]
+
+
+def test_handle_incoming_command_only_reply_skips_codex(monkeypatch) -> None:
+    from codex_mailbridge.daemon import IncomingMail
+
+    daemon = object.__new__(MailBridgeDaemon)
+    daemon.db = _QueueDB()
+    daemon.gmail = _FakeGmail()
+    daemon.exec = _FakeExec()
+    daemon.exec.live_panes.add("%2")
+    daemon._run_shell_command = lambda workspace, command: (f"$ {command}\n\n[stdout]\n/tmp/work\n\n[exit 0]", 0)
+    monkeypatch.setattr("codex_mailbridge.daemon.save_attachments", lambda workspace, attachments: ([], []))
+
+    daemon._handle_incoming(
+        IncomingMail(
+            uid="1",
+            gmail_message_id="m4",
+            gmail_thread_id="g1",
+            rfc_message_id="<reply@msg>",
+            subject="Re: subject",
+            from_address="user@example.com",
+            body_text="\n ! pwd\n\n\t! ls\n",
+            attachments=[],
+            references=[],
+        )
+    )
+
+    assert daemon.exec.sent_prompts == []
+    assert daemon.db.enqueued == []
+    assert daemon.db.submitted == []
+    assert daemon.db.deleted == []
+    assert daemon.gmail.calls == [
+        {
+            "subject": "Re: subject",
+            "markdown_body": "Shell command output from `/tmp/work`:\n\n```text\n$ pwd\n\n[stdout]\n/tmp/work\n\n[exit 0]\n```\n\n```text\n$ ls\n\n[stdout]\n/tmp/work\n\n[exit 0]\n```",
+            "parent_message_id": "<reply@msg>",
+            "references": ["<last@msg>"],
+        }
+    ]
 
 
 class _EndDB:

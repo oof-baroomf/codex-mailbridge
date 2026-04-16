@@ -8,6 +8,8 @@ Local daemon that:
 - inherits the normal global Codex CLI settings instead of forcing model/auth/agent overrides
 - saves attachments into the workspace named in the first message subject
 - queues only the new email reply text into Codex without adding extra instructions
+- treats reply lines starting with `!` as `bash -lc` commands in the thread workspace and emails their output back
+- skips Codex entirely when a reply only contains `!` commands and blank lines
 - interrupts the current turn if a newer email arrives for the same thread
 - emails the first assistant update immediately, then the last assistant reply when the turn finishes
 - emails Codex failures instead of silently stalling

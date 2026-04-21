@@ -184,7 +184,7 @@ def test_handle_incoming_running_thread_injects_without_interrupting(monkeypatch
     )
 
     assert daemon.exec.interrupted == []
-    assert daemon.exec.sent_prompts == []
+    assert daemon.exec.sent_prompts == [("%2", "new request")]
     assert daemon.db.enqueued == [
         {
             "agent_id": "agent-1",
@@ -195,23 +195,12 @@ def test_handle_incoming_running_thread_injects_without_interrupting(monkeypatch
             "attachment_paths": [],
         }
     ]
-    assert daemon.db.submitted == []
+    assert daemon.db.submitted == [(4, "%2", "/tmp/2.jsonl")]
     assert daemon.db.updated_reply_to == []
     assert daemon.db.deleted == []
-    assert daemon.gmail.calls == [
-        {
-            "subject": "Re: subject",
-            "markdown_body": "Queued your follow-up behind the current running turn. I'll send another update when Codex starts handling it.",
-            "parent_message_id": "<reply@msg>",
-            "references": ["<root@msg>", "<last@msg>", "<reply@msg>"],
-            "gmail_thread_id": "g1",
-        }
-    ]
-    assert daemon.db.recorded == [("pending:4", "assistant_progress", "<sent@msg>")]
-    assert daemon.db.updated_references == [
-        ("agent-1", ["<root@msg>", "<last@msg>", "<reply@msg>"]),
-        ("agent-1", ["<root@msg>", "<last@msg>", "<reply@msg>", "<sent@msg>"]),
-    ]
+    assert daemon.gmail.calls == []
+    assert daemon.db.recorded == []
+    assert daemon.db.updated_references == [("agent-1", ["<root@msg>", "<last@msg>", "<reply@msg>"])]
 
 
 def test_handle_incoming_running_thread_executes_shell_lines_and_sends_trimmed_prompt(monkeypatch) -> None:
@@ -239,7 +228,7 @@ def test_handle_incoming_running_thread_executes_shell_lines_and_sends_trimmed_p
         )
     )
 
-    assert daemon.exec.sent_prompts == []
+    assert daemon.exec.sent_prompts == [("%2", "Please check this")]
     assert daemon.db.enqueued == [
         {
             "agent_id": "agent-1",
@@ -256,13 +245,6 @@ def test_handle_incoming_running_thread_executes_shell_lines_and_sends_trimmed_p
             "markdown_body": "Shell command output from `/tmp/work`:\n\n```text\n$ pwd\n\n[stdout]\nok\n\n[exit 0]\n```\n\n```text\n$ git status --short\n\n[stdout]\nok\n\n[exit 0]\n```",
             "parent_message_id": "<reply@msg>",
             "references": ["<root@msg>", "<last@msg>", "<reply@msg>"],
-            "gmail_thread_id": "g1",
-        },
-        {
-            "subject": "Re: subject",
-            "markdown_body": "Queued your follow-up behind the current running turn. I'll send another update when Codex starts handling it.",
-            "parent_message_id": "<reply@msg>",
-            "references": ["<root@msg>", "<last@msg>", "<reply@msg>", "<sent@msg>"],
             "gmail_thread_id": "g1",
         }
     ]
@@ -443,20 +425,6 @@ class _StartDB:
     def __init__(self) -> None:
         self.marked: list[tuple[int, str | None, str | None, str | None]] = []
         self.updated_thread_ids: list[tuple[str, str]] = []
-        self.pending = PendingTurn(
-            id=7,
-            agent_id="agent-1",
-            gmail_message_id="m1",
-            reply_to_message_id=None,
-            text_body="continue",
-            image_paths=["/tmp/one.png"],
-            attachment_paths=[],
-            status="queued",
-            codex_turn_id=None,
-            started_at=None,
-            runner_pane_id=None,
-            runner_log_path=None,
-        )
 
     def tracked_threads(self):
         return [
@@ -472,7 +440,23 @@ class _StartDB:
         ]
 
     def pending_turns_for_agent(self, agent_id: str, statuses=("queued", "running")):
-        return [self.pending] if self.pending.status in statuses else []
+        return []
+
+    def next_queued_turn(self, agent_id: str) -> PendingTurn | None:
+        return PendingTurn(
+            id=7,
+            agent_id=agent_id,
+            gmail_message_id="m1",
+            reply_to_message_id=None,
+            text_body="continue",
+            image_paths=["/tmp/one.png"],
+            attachment_paths=[],
+            status="queued",
+            codex_turn_id=None,
+            started_at=None,
+            runner_pane_id=None,
+            runner_log_path=None,
+        )
 
     def update_thread_codex_id(self, agent_id: str, codex_thread_id: str) -> None:
         self.updated_thread_ids.append((agent_id, codex_thread_id))
@@ -672,34 +656,30 @@ def test_sync_pending_turn_marks_missing_codex_process_as_failure() -> None:
 
 def test_start_queued_turn_picks_submitted_turn_when_no_running_turn_exists() -> None:
     daemon = object.__new__(MailBridgeDaemon)
-    daemon.db = _StartDB()
+    daemon.db = _SyncDB()
+    daemon.gmail = _FakeGmail()
     daemon.exec = _FakeExec()
+    daemon.exec.live_panes.add("%1")
 
-    def pending_turns_for_agent(agent_id: str, statuses=("queued", "running")):
-        if statuses == ("running",):
-            return []
-        return [
-            PendingTurn(
-                id=8,
-                agent_id=agent_id,
-                gmail_message_id="m8",
-                reply_to_message_id="<reply@msg>",
-                text_body="queued earlier",
-                image_paths=[],
-                attachment_paths=[],
-                status="submitted",
-                codex_turn_id=None,
-                started_at=100,
-                runner_pane_id="%1",
-                runner_log_path="/tmp/turn.jsonl",
-            )
-        ]
+    pending = PendingTurn(
+        id=8,
+        agent_id="agent-1",
+        gmail_message_id="m8",
+        reply_to_message_id="<reply@msg>",
+        text_body="queued earlier",
+        image_paths=[],
+        attachment_paths=[],
+        status="submitted",
+        codex_turn_id=None,
+        started_at=100,
+        runner_pane_id="%1",
+        runner_log_path="/tmp/turn.jsonl",
+    )
 
-    daemon.db.pending_turns_for_agent = pending_turns_for_agent
+    daemon._sync_submitted_turn(daemon.db.thread, pending)
 
-    daemon._start_queued_turns()
-
-    assert daemon.db.marked == [(8, "turn-123", "%1", "/tmp/turn.jsonl")]
+    assert daemon.db.finished == []
+    assert daemon.exec.sent_prompts == []
 
 
 def test_handle_end_command_interrupts_running_turns_kills_session_and_acks() -> None:

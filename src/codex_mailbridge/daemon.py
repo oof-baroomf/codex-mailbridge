@@ -222,6 +222,23 @@ class MailBridgeDaemon:
         if not self.db.turn_email_exists(self._turn_key(pending), "assistant_reply"):
             self._send_turn_reply(thread, pending, _format_turn_failure(error_text))
 
+    def _submit_pending_turn(self, thread: ThreadRecord, pending: PendingTurn) -> None:
+        started = self.exec.submit_prompt(
+            agent_id=thread.agent_id,
+            workspace=Path(thread.workspace_path),
+            prompt=pending.text_body,
+            image_paths=pending.image_paths,
+            resume_session_id=_session_id_for_thread(thread),
+            wait_for_turn_id=False,
+        )
+        if started.thread_id and started.thread_id != thread.codex_thread_id:
+            self.db.update_thread_codex_id(thread.agent_id, started.thread_id)
+        self.db.mark_turn_submitted(
+            pending.id,
+            runner_pane_id=started.pane_id,
+            runner_log_path=started.log_path,
+        )
+
     def _run_shell_command(self, workspace: Path, command: str) -> tuple[str, int | None]:
         try:
             proc = subprocess.run(
@@ -381,34 +398,7 @@ class MailBridgeDaemon:
                 if shell_commands:
                     self._send_shell_command_reply(thread, msg.rfc_message_id, workspace, shell_commands)
                     shell_commands_sent = True
-                if prompt_text:
-                    running = self.db.pending_turns_for_agent(thread.agent_id, statuses=("running",))
-                    live_pending = next(
-                        (
-                            pending
-                            for pending in reversed(running)
-                            if pending.runner_pane_id and self.exec.pane_running_codex(pending.runner_pane_id)
-                        ),
-                        None,
-                    )
-                    if live_pending is not None:
-                        pending_turn_id = self.db.enqueue_turn(
-                            agent_id=thread.agent_id,
-                            gmail_message_id=msg.gmail_message_id,
-                            reply_to_message_id=msg.rfc_message_id,
-                            text_body=prompt_text,
-                            image_paths=image_paths,
-                            attachment_paths=attachment_paths,
-                        )
-                        self.exec.send_prompt(live_pending.runner_pane_id, prompt_text)
-                        self.db.mark_turn_submitted(
-                            pending_turn_id,
-                            runner_pane_id=live_pending.runner_pane_id,
-                            runner_log_path=live_pending.runner_log_path,
-                        )
-                        return
-                    self.db.delete_pending_turns([pending.id for pending in self.db.pending_turns_for_agent(thread.agent_id, statuses=("queued",))])
-                else:
+                if not prompt_text:
                     return
 
         if attachment_paths is None or image_paths is None:
@@ -418,7 +408,7 @@ class MailBridgeDaemon:
         if not prompt_text:
             return
         assert thread is not None
-        self.db.enqueue_turn(
+        pending_turn_id = self.db.enqueue_turn(
             agent_id=thread.agent_id,
             gmail_message_id=msg.gmail_message_id,
             reply_to_message_id=msg.rfc_message_id,
@@ -426,6 +416,21 @@ class MailBridgeDaemon:
             image_paths=image_paths,
             attachment_paths=attachment_paths,
         )
+        pending = PendingTurn(
+            id=pending_turn_id,
+            agent_id=thread.agent_id,
+            gmail_message_id=msg.gmail_message_id,
+            reply_to_message_id=msg.rfc_message_id,
+            text_body=prompt_text,
+            image_paths=image_paths,
+            attachment_paths=attachment_paths,
+            status="queued",
+            codex_turn_id=None,
+            started_at=None,
+            runner_pane_id=None,
+            runner_log_path=None,
+        )
+        self._submit_pending_turn(thread, pending)
 
     def _handle_end_command(self, thread: ThreadRecord, reply_to_message_id: str | None) -> None:
         queued_ids: list[int] = []
@@ -469,33 +474,12 @@ class MailBridgeDaemon:
 
     def _start_queued_turns(self) -> None:
         for thread in self.db.tracked_threads():
-            active = self.db.pending_turns_for_agent(thread.agent_id, statuses=("running", "submitted"))
-            if active:
-                continue
-            pending = self.db.next_queued_turn(thread.agent_id)
-            if pending is None:
-                continue
-            try:
-                started = self.exec.start_turn(
-                    agent_id=thread.agent_id,
-                    workspace=Path(thread.workspace_path),
-                    pending_turn_id=pending.id,
-                    prompt=pending.text_body,
-                    image_paths=pending.image_paths,
-                    resume_session_id=_session_id_for_thread(thread),
-                )
-            except Exception as exc:
-                LOG.exception("Failed to start queued turn for %s", thread.agent_id)
-                self._fail_pending_turn(thread, pending, str(exc))
-                continue
-            if started.thread_id and started.thread_id != thread.codex_thread_id:
-                self.db.update_thread_codex_id(thread.agent_id, started.thread_id)
-            self.db.mark_turn_running(
-                pending.id,
-                codex_turn_id=started.turn_id,
-                runner_pane_id=started.pane_id,
-                runner_log_path=started.log_path,
-            )
+            for pending in self.db.pending_turns_for_agent(thread.agent_id, statuses=("queued",)):
+                try:
+                    self._submit_pending_turn(thread, pending)
+                except Exception as exc:
+                    LOG.exception("Failed to submit queued turn for %s", thread.agent_id)
+                    self._fail_pending_turn(thread, pending, str(exc))
 
     def _sync_running_turns(self) -> None:
         if not self.config.gmail.configured:
@@ -528,6 +512,7 @@ class MailBridgeDaemon:
             return
         if pending.runner_pane_id and not self.exec.pane_running_codex(pending.runner_pane_id):
             self._fail_pending_turn(thread, pending, "Codex exited before handling the injected email.")
+            return
 
     def _sync_pending_turn(self, thread: ThreadRecord, pending: PendingTurn) -> None:
         state = self.exec.read_turn_state(pending.runner_log_path, pending.codex_turn_id)

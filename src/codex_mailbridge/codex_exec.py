@@ -131,6 +131,25 @@ class CodexExecManager:
         image_paths: list[str],
         resume_session_id: str | None,
     ) -> StartedTurn:
+        return self.submit_prompt(
+            agent_id=agent_id,
+            workspace=workspace,
+            prompt=prompt,
+            image_paths=image_paths,
+            resume_session_id=resume_session_id,
+            wait_for_turn_id=True,
+        )
+
+    def submit_prompt(
+        self,
+        *,
+        agent_id: str,
+        workspace: Path,
+        prompt: str,
+        image_paths: list[str],
+        resume_session_id: str | None,
+        wait_for_turn_id: bool,
+    ) -> StartedTurn:
         session_path = self._session_path_for_id(resume_session_id) if resume_session_id else None
         if resume_session_id and session_path is None:
             raise RuntimeError(f"Could not locate Codex session file for {resume_session_id}")
@@ -155,12 +174,14 @@ class CodexExecManager:
         if session_path is None:
             self._send_prompt(pane_id, prompt)
             session_path, resume_session_id = self._wait_for_new_session(workspace, launched_at, pane_id)
-            turn_id = self._wait_for_turn_id(session_path, 0)
-        assert session_path is not None
-        if resume_session_id is not None and turn_id is None:
+            if wait_for_turn_id:
+                turn_id = self._wait_for_turn_id(session_path, 0)
+        else:
             pre_submit_size = session_path.stat().st_size if session_path.exists() else 0
             self._send_prompt(pane_id, prompt)
-            turn_id = self._wait_for_turn_id(session_path, pre_submit_size)
+            if wait_for_turn_id:
+                turn_id = self._wait_for_turn_id(session_path, pre_submit_size)
+        assert session_path is not None
 
         if not self._session_has_attached_clients(session_name):
             subprocess.run(["tmux", "select-window", "-t", self._session_target(agent_id)], check=False)

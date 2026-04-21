@@ -69,6 +69,16 @@ def _reply_subject(subject: str) -> str:
     return subject if subject.lower().startswith("re:") else f"Re: {subject}"
 
 
+def _subject_key(subject: str) -> str:
+    normalized = subject.strip()
+    while True:
+        match = re.match(r"^(?:re|fwd)\s*:\s*(.*)$", normalized, flags=re.IGNORECASE)
+        if not match:
+            break
+        normalized = match.group(1).strip()
+    return re.sub(r"\s+", " ", normalized).strip().lower()
+
+
 _QUOTED_REPLY_MARKERS = (
     re.compile(r"^\s*On .+wrote:\s*$"),
     re.compile(r"^\s*Begin forwarded message:\s*$", re.IGNORECASE),
@@ -157,6 +167,16 @@ class MailBridgeDaemon:
     def _fresh_thread(self, thread: ThreadRecord) -> ThreadRecord:
         current = self.db.get_thread_by_agent(thread.agent_id)
         return current or thread
+
+    def _resolve_existing_thread(self, msg: IncomingMail) -> ThreadRecord | None:
+        reference_set = set(normalize_message_ids([*msg.references, msg.rfc_message_id]))
+        subject_key = _subject_key(msg.subject)
+        for thread in self.db.tracked_threads():
+            if reference_set and reference_set.intersection(thread.email_references):
+                return thread
+            if _subject_key(thread.canonical_subject) == subject_key:
+                return thread
+        return None
 
     def _send_turn_reply(self, thread: ThreadRecord, pending: PendingTurn, body: str) -> None:
         current_thread = self._fresh_thread(thread)
@@ -321,20 +341,34 @@ class MailBridgeDaemon:
         shell_commands_sent = False
         thread = self.db.get_thread_by_gmail_thread(msg.gmail_thread_id)
         if thread is None:
+            thread = self._resolve_existing_thread(msg)
+            if thread is not None and thread.gmail_thread_id != msg.gmail_thread_id:
+                self.db.update_thread_gmail_id(thread.agent_id, msg.gmail_thread_id)
+                thread = self._fresh_thread(thread)
+        if thread is None:
             raw_path, agent_id = parse_subject(msg.subject)
             workspace = normalize_workspace_path(raw_path)
             if prompt_text or shell_commands:
-                if self.db.get_thread_by_agent(agent_id) is not None:
-                    raise SubjectParseError(f"Agent id '{agent_id}' has already been used")
-                thread = self._create_thread(
-                    agent_id=agent_id,
-                    workspace=workspace,
-                    gmail_thread_id=msg.gmail_thread_id,
-                    canonical_subject=msg.subject,
-                    initial_message_id=msg.rfc_message_id,
-                    initial_references=normalize_message_ids([*msg.references, msg.rfc_message_id]),
-                )
-        else:
+                existing_thread = self.db.get_thread_by_agent(agent_id)
+                if existing_thread is not None:
+                    existing_workspace = Path(existing_thread.workspace_path).resolve()
+                    if workspace != existing_workspace:
+                        raise SubjectParseError(
+                            f"Agent id '{agent_id}' has already been used for {existing_thread.workspace_path}"
+                        )
+                    self.db.update_thread_gmail_id(existing_thread.agent_id, msg.gmail_thread_id)
+                    thread = self.db.get_thread_by_agent(existing_thread.agent_id)
+                    assert thread is not None
+                else:
+                    thread = self._create_thread(
+                        agent_id=agent_id,
+                        workspace=workspace,
+                        gmail_thread_id=msg.gmail_thread_id,
+                        canonical_subject=msg.subject,
+                        initial_message_id=msg.rfc_message_id,
+                        initial_references=normalize_message_ids([*msg.references, msg.rfc_message_id]),
+                    )
+        if thread is not None:
             merged_references = normalize_message_ids([*thread.email_references, *msg.references, msg.rfc_message_id])
             if merged_references != thread.email_references:
                 self.db.update_email_references(thread.agent_id, merged_references)

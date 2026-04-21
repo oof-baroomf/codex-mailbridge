@@ -62,6 +62,7 @@ class _QueueDB:
         self.updated_reply_to: list[tuple[int, str | None]] = []
         self.updated_email: list[tuple[str, str]] = []
         self.updated_references: list[tuple[str, list[str]]] = []
+        self.updated_thread_ids: list[tuple[str, str]] = []
         self.deleted: list[int] = []
         self.thread = type(
             "Thread",
@@ -78,10 +79,15 @@ class _QueueDB:
         )()
 
     def get_thread_by_gmail_thread(self, gmail_thread_id: str):
-        return self.thread
+        if gmail_thread_id == self.thread.gmail_thread_id:
+            return self.thread
+        return None
 
     def get_thread_by_agent(self, agent_id: str):
         return self.thread
+
+    def tracked_threads(self):
+        return [self.thread]
 
     def pending_turns_for_agent(self, agent_id: str, statuses=("queued", "running")):
         turns = [
@@ -136,6 +142,10 @@ class _QueueDB:
     def update_email_references(self, agent_id: str, email_references: list[str]) -> None:
         self.updated_references.append((agent_id, email_references))
         self.thread.email_references = email_references
+
+    def update_thread_gmail_id(self, agent_id: str, gmail_thread_id: str) -> None:
+        self.updated_thread_ids.append((agent_id, gmail_thread_id))
+        self.thread.gmail_thread_id = gmail_thread_id
 
 
 def test_split_reply_commands_separates_shell_lines() -> None:
@@ -269,6 +279,41 @@ def test_handle_incoming_command_only_reply_skips_codex(monkeypatch) -> None:
             "parent_message_id": "<reply@msg>",
             "references": ["<root@msg>", "<last@msg>", "<reply@msg>"],
             "gmail_thread_id": "g1",
+        }
+    ]
+
+
+def test_handle_incoming_unknown_gmail_thread_resolves_by_reply_subject(monkeypatch) -> None:
+    from codex_mailbridge.daemon import IncomingMail
+
+    daemon = object.__new__(MailBridgeDaemon)
+    daemon.db = _QueueDB()
+    daemon.exec = _FakeExec()
+    monkeypatch.setattr("codex_mailbridge.daemon.save_attachments", lambda workspace, attachments: ([], []))
+
+    daemon._handle_incoming(
+        IncomingMail(
+            uid="1",
+            gmail_message_id="m9",
+            gmail_thread_id="g-split",
+            rfc_message_id="<reply2@msg>",
+            subject="Re: subject",
+            from_address="user@example.com",
+            body_text="follow up",
+            attachments=[],
+            references=["<last@msg>"],
+        )
+    )
+
+    assert daemon.db.updated_thread_ids == [("agent-1", "g-split")]
+    assert daemon.db.enqueued == [
+        {
+            "agent_id": "agent-1",
+            "gmail_message_id": "m9",
+            "reply_to_message_id": "<reply2@msg>",
+            "text_body": "follow up",
+            "image_paths": [],
+            "attachment_paths": [],
         }
     ]
 

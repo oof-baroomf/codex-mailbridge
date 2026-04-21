@@ -233,6 +233,13 @@ class StateDB:
         )
         self.conn.commit()
 
+    def update_thread_gmail_id(self, agent_id: str, gmail_thread_id: str) -> None:
+        self.conn.execute(
+            "UPDATE threads SET gmail_thread_id = ?, updated_at = ? WHERE agent_id = ?",
+            (gmail_thread_id, int(time.time()), agent_id),
+        )
+        self.conn.commit()
+
     def update_last_email_message_id(self, agent_id: str, message_id: str) -> None:
         self.conn.execute(
             "UPDATE threads SET last_email_message_id = ?, updated_at = ? WHERE agent_id = ?",

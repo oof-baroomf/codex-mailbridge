@@ -213,6 +213,7 @@ class GmailClient:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.auth = GmailAuth(config)
+        self._gmail_api_send_enabled = True
 
     def _open_imap(self) -> imaplib.IMAP4_SSL:
         imap = imaplib.IMAP4_SSL(
@@ -336,11 +337,22 @@ class GmailClient:
         msg.set_content(markdown_body)
         msg.add_alternative(html_body, subtype="html")
 
-        if self.config.gmail.auth_mode == "oauth":
+        if self.config.gmail.auth_mode == "oauth" and getattr(self, "_gmail_api_send_enabled", True):
             try:
                 return self._send_via_gmail_api(msg, gmail_thread_id)
-            except Exception:
-                LOG.exception("Gmail API send failed; falling back to SMTP")
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                response_text = ""
+                if response is not None:
+                    try:
+                        response_text = response.text
+                    except Exception:
+                        response_text = ""
+                if getattr(response, "status_code", None) == 403 and "SERVICE_DISABLED" in response_text:
+                    self._gmail_api_send_enabled = False
+                    LOG.warning("Gmail API send is disabled for this OAuth project; using SMTP fallback")
+                else:
+                    LOG.exception("Gmail API send failed; falling back to SMTP")
 
         smtp = smtplib.SMTP(self.config.gmail.smtp_host, self.config.gmail.smtp_port, timeout=30)
         try:

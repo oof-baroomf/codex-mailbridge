@@ -30,6 +30,7 @@ LOG = logging.getLogger(__name__)
 MAIL_SCOPE = ["https://mail.google.com/"]
 IMAP_TIMEOUT_SECONDS = 30
 _GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
+_MESSAGE_ID_PATTERN = re.compile(r"<[^<>]+>")
 
 
 class _HTMLStripper(HTMLParser):
@@ -130,6 +131,23 @@ class IncomingMail:
     references: list[str]
 
 
+def normalize_message_ids(values: Iterable[str | None]) -> list[str]:
+    refs: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        matches = _MESSAGE_ID_PATTERN.findall(value)
+        items = matches or [value.strip()]
+        for item in items:
+            ref = item.strip()
+            if not ref or ref in seen:
+                continue
+            seen.add(ref)
+            refs.append(ref)
+    return refs
+
+
 def _parse_gmail_fetch_metadata(meta: bytes) -> tuple[str, str]:
     text = meta.decode("utf-8", errors="ignore")
     msgid_match = re.search(r"X-GM-MSGID (\d+)", text)
@@ -221,7 +239,7 @@ class GmailClient:
                 gmail_message_id, gmail_thread_id = _parse_gmail_fetch_metadata(meta)
                 msg = email.message_from_bytes(raw_message, policy=policy.default)
                 body = _extract_body(msg)
-                refs = [ref.strip() for ref in (msg.get("References", "") + " " + (msg.get("In-Reply-To", "") or "")).split() if ref.strip()]
+                refs = normalize_message_ids([msg.get("References", ""), msg.get("In-Reply-To", "") or ""])
                 messages.append(
                     IncomingMail(
                         uid=uid,
@@ -273,7 +291,7 @@ class GmailClient:
             msg["Reply-To"] = reply_to
         if in_reply_to:
             msg["In-Reply-To"] = in_reply_to
-        refs = list(dict.fromkeys([ref for ref in references if ref]))
+        refs = normalize_message_ids(references)
         if in_reply_to and in_reply_to not in refs:
             refs.append(in_reply_to)
         if refs:

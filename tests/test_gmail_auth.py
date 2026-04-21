@@ -8,6 +8,7 @@ from codex_mailbridge.emailer import (
     _xoauth2_b64,
     canonical_email_address,
     email_addresses_match,
+    normalize_message_ids,
     save_attachments,
 )
 
@@ -28,6 +29,17 @@ def test_canonical_email_address_normalizes_gmail_aliases() -> None:
 
 def test_email_addresses_match_accepts_gmail_plus_aliases() -> None:
     assert email_addresses_match("dhruv9saini+canned.response@gmail.com", "dhruv9saini@gmail.com")
+
+
+def test_normalize_message_ids_extracts_and_deduplicates_headers() -> None:
+    assert normalize_message_ids(
+        [
+            "<root@msg> <mid@msg>",
+            "text <mid@msg> <leaf@msg>",
+            None,
+            " <leaf@msg> ",
+        ]
+    ) == ["<root@msg>", "<mid@msg>", "<leaf@msg>"]
 
 
 def test_open_imap_sets_timeout(monkeypatch) -> None:

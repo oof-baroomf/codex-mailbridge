@@ -15,6 +15,7 @@ class ThreadRecord:
     workspace_path: str
     canonical_subject: str
     last_email_message_id: str | None
+    email_references: list[str]
 
 
 @dataclass(slots=True)
@@ -52,6 +53,7 @@ class StateDB:
                 workspace_path TEXT NOT NULL,
                 canonical_subject TEXT NOT NULL,
                 last_email_message_id TEXT,
+                email_references_json TEXT NOT NULL DEFAULT '[]',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -103,6 +105,7 @@ class StateDB:
         )
         self._ensure_column("pending_turns", "runner_pane_id", "TEXT")
         self._ensure_column("pending_turns", "runner_log_path", "TEXT")
+        self._ensure_column("threads", "email_references_json", "TEXT NOT NULL DEFAULT '[]'")
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -114,6 +117,11 @@ class StateDB:
 
     def close(self) -> None:
         self.conn.close()
+
+    def _thread_from_row(self, row: sqlite3.Row) -> ThreadRecord:
+        data = dict(row)
+        data["email_references"] = json.loads(data.pop("email_references_json"))
+        return ThreadRecord(**data)
 
     def _pending_from_row(self, row: sqlite3.Row) -> PendingTurn:
         return PendingTurn(
@@ -158,22 +166,22 @@ class StateDB:
     def get_thread_by_agent(self, agent_id: str) -> ThreadRecord | None:
         row = self.conn.execute(
             """
-            SELECT agent_id, codex_thread_id, gmail_thread_id, workspace_path, canonical_subject, last_email_message_id
+            SELECT agent_id, codex_thread_id, gmail_thread_id, workspace_path, canonical_subject, last_email_message_id, email_references_json
             FROM threads WHERE agent_id = ?
             """,
             (agent_id,),
         ).fetchone()
-        return ThreadRecord(**dict(row)) if row else None
+        return self._thread_from_row(row) if row else None
 
     def get_thread_by_gmail_thread(self, gmail_thread_id: str) -> ThreadRecord | None:
         row = self.conn.execute(
             """
-            SELECT agent_id, codex_thread_id, gmail_thread_id, workspace_path, canonical_subject, last_email_message_id
+            SELECT agent_id, codex_thread_id, gmail_thread_id, workspace_path, canonical_subject, last_email_message_id, email_references_json
             FROM threads WHERE gmail_thread_id = ?
             """,
             (gmail_thread_id,),
         ).fetchone()
-        return ThreadRecord(**dict(row)) if row else None
+        return self._thread_from_row(row) if row else None
 
     def upsert_thread(
         self,
@@ -184,19 +192,24 @@ class StateDB:
         workspace_path: str,
         canonical_subject: str,
         last_email_message_id: str | None,
+        email_references: list[str],
     ) -> None:
         now = int(time.time())
         self.conn.execute(
             """
             INSERT INTO threads
-            (agent_id, codex_thread_id, gmail_thread_id, workspace_path, canonical_subject, last_email_message_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (agent_id, codex_thread_id, gmail_thread_id, workspace_path, canonical_subject, last_email_message_id, email_references_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(agent_id) DO UPDATE SET
                 codex_thread_id = excluded.codex_thread_id,
                 gmail_thread_id = excluded.gmail_thread_id,
                 workspace_path = excluded.workspace_path,
                 canonical_subject = excluded.canonical_subject,
                 last_email_message_id = COALESCE(excluded.last_email_message_id, threads.last_email_message_id),
+                email_references_json = CASE
+                    WHEN excluded.email_references_json = '[]' THEN threads.email_references_json
+                    ELSE excluded.email_references_json
+                END,
                 updated_at = excluded.updated_at
             """,
             (
@@ -206,6 +219,7 @@ class StateDB:
                 workspace_path,
                 canonical_subject,
                 last_email_message_id,
+                json.dumps(email_references),
                 now,
                 now,
             ),
@@ -223,6 +237,13 @@ class StateDB:
         self.conn.execute(
             "UPDATE threads SET last_email_message_id = ?, updated_at = ? WHERE agent_id = ?",
             (message_id, int(time.time()), agent_id),
+        )
+        self.conn.commit()
+
+    def update_email_references(self, agent_id: str, email_references: list[str]) -> None:
+        self.conn.execute(
+            "UPDATE threads SET email_references_json = ?, updated_at = ? WHERE agent_id = ?",
+            (json.dumps(email_references), int(time.time()), agent_id),
         )
         self.conn.commit()
 
@@ -412,9 +433,9 @@ class StateDB:
     def tracked_threads(self) -> list[ThreadRecord]:
         rows = self.conn.execute(
             """
-            SELECT agent_id, codex_thread_id, gmail_thread_id, workspace_path, canonical_subject, last_email_message_id
+            SELECT agent_id, codex_thread_id, gmail_thread_id, workspace_path, canonical_subject, last_email_message_id, email_references_json
             FROM threads
             ORDER BY updated_at ASC
             """
         ).fetchall()
-        return [ThreadRecord(**dict(row)) for row in rows]
+        return [self._thread_from_row(row) for row in rows]

@@ -11,7 +11,7 @@ import time
 from .codex_exec import CodexExecManager
 from .config import Config
 from .db import PendingTurn, StateDB, ThreadRecord
-from .emailer import GmailClient, IncomingMail, email_addresses_match, save_attachments
+from .emailer import GmailClient, IncomingMail, email_addresses_match, normalize_message_ids, save_attachments
 
 
 LOG = logging.getLogger(__name__)
@@ -165,9 +165,10 @@ class MailBridgeDaemon:
             subject=_reply_subject(current_thread.canonical_subject),
             markdown_body=body,
             parent_message_id=parent,
-            references=[current_thread.last_email_message_id] if current_thread.last_email_message_id else [],
+            references=current_thread.email_references,
         )
         self.db.record_turn_email(self._turn_key(pending), "assistant_reply", email_id)
+        self.db.update_email_references(current_thread.agent_id, normalize_message_ids([*current_thread.email_references, email_id]))
         self.db.update_last_email_message_id(current_thread.agent_id, email_id)
 
     def _send_turn_progress_reply(self, thread: ThreadRecord, pending: PendingTurn, body: str) -> None:
@@ -177,9 +178,10 @@ class MailBridgeDaemon:
             subject=_reply_subject(current_thread.canonical_subject),
             markdown_body=body,
             parent_message_id=parent,
-            references=[current_thread.last_email_message_id] if current_thread.last_email_message_id else [],
+            references=current_thread.email_references,
         )
         self.db.record_turn_email(self._turn_key(pending), "assistant_progress", email_id)
+        self.db.update_email_references(current_thread.agent_id, normalize_message_ids([*current_thread.email_references, email_id]))
         self.db.update_last_email_message_id(current_thread.agent_id, email_id)
 
     def _send_thread_reply(self, thread: ThreadRecord, parent_message_id: str | None, body: str) -> None:
@@ -188,8 +190,9 @@ class MailBridgeDaemon:
             subject=_reply_subject(current_thread.canonical_subject),
             markdown_body=body,
             parent_message_id=parent_message_id or current_thread.last_email_message_id,
-            references=[current_thread.last_email_message_id] if current_thread.last_email_message_id else [],
+            references=current_thread.email_references,
         )
+        self.db.update_email_references(current_thread.agent_id, normalize_message_ids([*current_thread.email_references, email_id]))
         self.db.update_last_email_message_id(current_thread.agent_id, email_id)
 
     def _fail_pending_turn(self, thread: ThreadRecord, pending: PendingTurn, error_text: str) -> None:
@@ -326,8 +329,13 @@ class MailBridgeDaemon:
                     gmail_thread_id=msg.gmail_thread_id,
                     canonical_subject=msg.subject,
                     initial_message_id=msg.rfc_message_id,
+                    initial_references=normalize_message_ids([*msg.references, msg.rfc_message_id]),
                 )
         else:
+            merged_references = normalize_message_ids([*thread.email_references, *msg.references, msg.rfc_message_id])
+            if merged_references != thread.email_references:
+                self.db.update_email_references(thread.agent_id, merged_references)
+                thread = self._fresh_thread(thread)
             workspace = Path(thread.workspace_path)
             if prompt_text or shell_commands:
                 if not shell_commands and _is_end_command(prompt_text):
@@ -408,6 +416,7 @@ class MailBridgeDaemon:
         gmail_thread_id: str,
         canonical_subject: str,
         initial_message_id: str | None,
+        initial_references: list[str],
     ) -> ThreadRecord:
         self.db.upsert_thread(
             agent_id=agent_id,
@@ -416,6 +425,7 @@ class MailBridgeDaemon:
             workspace_path=str(workspace),
             canonical_subject=canonical_subject,
             last_email_message_id=initial_message_id,
+            email_references=initial_references,
         )
         thread = self.db.get_thread_by_agent(agent_id)
         assert thread is not None

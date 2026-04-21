@@ -61,6 +61,7 @@ class _QueueDB:
         self.submitted: list[tuple[int, str | None, str | None]] = []
         self.updated_reply_to: list[tuple[int, str | None]] = []
         self.updated_email: list[tuple[str, str]] = []
+        self.updated_references: list[tuple[str, list[str]]] = []
         self.deleted: list[int] = []
         self.thread = type(
             "Thread",
@@ -72,6 +73,7 @@ class _QueueDB:
                 "workspace_path": "/tmp/work",
                 "canonical_subject": "subject",
                 "last_email_message_id": "<last@msg>",
+                "email_references": ["<root@msg>", "<last@msg>"],
             },
         )()
 
@@ -131,6 +133,10 @@ class _QueueDB:
         self.updated_email.append((agent_id, message_id))
         self.thread.last_email_message_id = message_id
 
+    def update_email_references(self, agent_id: str, email_references: list[str]) -> None:
+        self.updated_references.append((agent_id, email_references))
+        self.thread.email_references = email_references
+
 
 def test_split_reply_commands_separates_shell_lines() -> None:
     prompt_text, shell_commands = _split_reply_commands("first line\n  ! pwd\n\nsecond line\n! ls -1\n")
@@ -177,6 +183,7 @@ def test_handle_incoming_running_thread_injects_without_interrupting(monkeypatch
     assert daemon.db.submitted == [(4, "%2", "/tmp/2.jsonl")]
     assert daemon.db.updated_reply_to == []
     assert daemon.db.deleted == []
+    assert daemon.db.updated_references == [("agent-1", ["<root@msg>", "<last@msg>", "<reply@msg>"])]
 
 
 def test_handle_incoming_running_thread_executes_shell_lines_and_sends_trimmed_prompt(monkeypatch) -> None:
@@ -220,7 +227,7 @@ def test_handle_incoming_running_thread_executes_shell_lines_and_sends_trimmed_p
             "subject": "Re: subject",
             "markdown_body": "Shell command output from `/tmp/work`:\n\n```text\n$ pwd\n\n[stdout]\nok\n\n[exit 0]\n```\n\n```text\n$ git status --short\n\n[stdout]\nok\n\n[exit 0]\n```",
             "parent_message_id": "<reply@msg>",
-            "references": ["<last@msg>"],
+            "references": ["<root@msg>", "<last@msg>", "<reply@msg>"],
         }
     ]
 
@@ -259,7 +266,7 @@ def test_handle_incoming_command_only_reply_skips_codex(monkeypatch) -> None:
             "subject": "Re: subject",
             "markdown_body": "Shell command output from `/tmp/work`:\n\n```text\n$ pwd\n\n[stdout]\n/tmp/work\n\n[exit 0]\n```\n\n```text\n$ ls\n\n[stdout]\n/tmp/work\n\n[exit 0]\n```",
             "parent_message_id": "<reply@msg>",
-            "references": ["<last@msg>"],
+            "references": ["<root@msg>", "<last@msg>", "<reply@msg>"],
         }
     ]
 
@@ -295,6 +302,7 @@ class _EndDB:
         self.deleted: list[int] = []
         self.finished: list[tuple[int, str | None]] = []
         self.updated_email: list[tuple[str, str]] = []
+        self.updated_references: list[tuple[str, list[str]]] = []
         self.thread = type(
             "Thread",
             (),
@@ -305,6 +313,7 @@ class _EndDB:
                 "workspace_path": "/tmp/work",
                 "canonical_subject": "subject",
                 "last_email_message_id": "<last@msg>",
+                "email_references": ["<root@msg>", "<last@msg>"],
             },
         )()
 
@@ -352,6 +361,10 @@ class _EndDB:
     def update_last_email_message_id(self, agent_id: str, message_id: str) -> None:
         self.updated_email.append((agent_id, message_id))
         self.thread.last_email_message_id = message_id
+
+    def update_email_references(self, agent_id: str, email_references: list[str]) -> None:
+        self.updated_references.append((agent_id, email_references))
+        self.thread.email_references = email_references
 
 
 class _StartDB:
@@ -424,6 +437,7 @@ class _SyncDB:
         self.finished: list[tuple[int, str | None]] = []
         self.recorded: list[tuple[str, str, str]] = []
         self.updated_email: list[tuple[str, str]] = []
+        self.updated_references: list[tuple[str, list[str]]] = []
         self.updated_thread_ids: list[tuple[str, str]] = []
         self.submitted: list[tuple[int, str | None, str | None]] = []
         self.thread = type(
@@ -436,6 +450,7 @@ class _SyncDB:
                 "workspace_path": "/tmp/work",
                 "canonical_subject": "subject",
                 "last_email_message_id": "<last@msg>",
+                "email_references": ["<root@msg>", "<last@msg>"],
             },
         )()
 
@@ -461,6 +476,10 @@ class _SyncDB:
     def update_last_email_message_id(self, agent_id: str, message_id: str) -> None:
         self.updated_email.append((agent_id, message_id))
         self.thread.last_email_message_id = message_id
+
+    def update_email_references(self, agent_id: str, email_references: list[str]) -> None:
+        self.updated_references.append((agent_id, email_references))
+        self.thread.email_references = email_references
 
 
 def _pending() -> PendingTurn:
@@ -518,7 +537,7 @@ def test_sync_pending_turn_completed_without_final_message_uses_error_reply() ->
             "subject": "Re: subject",
             "markdown_body": "Codex error:\n\nSelected model is at capacity. Please try a different model.",
             "parent_message_id": "<reply@msg>",
-            "references": ["<last@msg>"],
+            "references": ["<root@msg>", "<last@msg>"],
         }
     ]
 
@@ -541,7 +560,7 @@ def test_sync_pending_turn_emails_failure() -> None:
             "subject": "Re: subject",
             "markdown_body": "Codex error:\n\nboom",
             "parent_message_id": "<reply@msg>",
-            "references": ["<last@msg>"],
+            "references": ["<root@msg>", "<last@msg>"],
         }
     ]
 
@@ -577,7 +596,7 @@ def test_sync_pending_turn_marks_missing_codex_process_as_failure() -> None:
             "subject": "Re: subject",
             "markdown_body": "Codex error:\n\nCodex exited without a final status.",
             "parent_message_id": "<reply@msg>",
-            "references": ["<last@msg>"],
+            "references": ["<root@msg>", "<last@msg>"],
         }
     ]
 
@@ -659,6 +678,6 @@ def test_handle_end_command_interrupts_running_turns_kills_session_and_acks() ->
             "subject": "Re: subject",
             "markdown_body": "Ended. The tmux session was stopped. Reply again on this thread to resume the same Codex session.",
             "parent_message_id": "<reply@msg>",
-            "references": ["<last@msg>"],
+            "references": ["<root@msg>", "<last@msg>"],
         }
     ]

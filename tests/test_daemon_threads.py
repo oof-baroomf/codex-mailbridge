@@ -58,6 +58,7 @@ class _FakeGmail:
 class _QueueDB:
     def __init__(self) -> None:
         self.enqueued: list[dict] = []
+        self.recorded: list[tuple[str, str, str]] = []
         self.submitted: list[tuple[int, str | None, str | None]] = []
         self.updated_reply_to: list[tuple[int, str | None]] = []
         self.updated_email: list[tuple[str, str]] = []
@@ -135,6 +136,9 @@ class _QueueDB:
     def delete_pending_turns(self, pending_turn_ids: list[int]) -> None:
         self.deleted = pending_turn_ids
 
+    def record_turn_email(self, turn_id: str, kind: str, email_message_id: str) -> None:
+        self.recorded.append((turn_id, kind, email_message_id))
+
     def update_last_email_message_id(self, agent_id: str, message_id: str) -> None:
         self.updated_email.append((agent_id, message_id))
         self.thread.last_email_message_id = message_id
@@ -160,6 +164,7 @@ def test_handle_incoming_running_thread_injects_without_interrupting(monkeypatch
 
     daemon = object.__new__(MailBridgeDaemon)
     daemon.db = _QueueDB()
+    daemon.gmail = _FakeGmail()
     daemon.exec = _FakeExec()
     daemon.exec.live_panes.add("%2")
     monkeypatch.setattr("codex_mailbridge.daemon.save_attachments", lambda workspace, attachments: ([], []))
@@ -193,7 +198,20 @@ def test_handle_incoming_running_thread_injects_without_interrupting(monkeypatch
     assert daemon.db.submitted == [(4, "%2", "/tmp/2.jsonl")]
     assert daemon.db.updated_reply_to == []
     assert daemon.db.deleted == []
-    assert daemon.db.updated_references == [("agent-1", ["<root@msg>", "<last@msg>", "<reply@msg>"])]
+    assert daemon.gmail.calls == [
+        {
+            "subject": "Re: subject",
+            "markdown_body": "Queued your follow-up behind the current running turn. I'll send another update when Codex starts handling it.",
+            "parent_message_id": "<reply@msg>",
+            "references": ["<root@msg>", "<last@msg>", "<reply@msg>"],
+            "gmail_thread_id": "g1",
+        }
+    ]
+    assert daemon.db.recorded == [("pending:4", "assistant_progress", "<sent@msg>")]
+    assert daemon.db.updated_references == [
+        ("agent-1", ["<root@msg>", "<last@msg>", "<reply@msg>"]),
+        ("agent-1", ["<root@msg>", "<last@msg>", "<reply@msg>", "<sent@msg>"]),
+    ]
 
 
 def test_handle_incoming_running_thread_executes_shell_lines_and_sends_trimmed_prompt(monkeypatch) -> None:
@@ -238,6 +256,13 @@ def test_handle_incoming_running_thread_executes_shell_lines_and_sends_trimmed_p
             "markdown_body": "Shell command output from `/tmp/work`:\n\n```text\n$ pwd\n\n[stdout]\nok\n\n[exit 0]\n```\n\n```text\n$ git status --short\n\n[stdout]\nok\n\n[exit 0]\n```",
             "parent_message_id": "<reply@msg>",
             "references": ["<root@msg>", "<last@msg>", "<reply@msg>"],
+            "gmail_thread_id": "g1",
+        },
+        {
+            "subject": "Re: subject",
+            "markdown_body": "Queued your follow-up behind the current running turn. I'll send another update when Codex starts handling it.",
+            "parent_message_id": "<reply@msg>",
+            "references": ["<root@msg>", "<last@msg>", "<reply@msg>", "<sent@msg>"],
             "gmail_thread_id": "g1",
         }
     ]

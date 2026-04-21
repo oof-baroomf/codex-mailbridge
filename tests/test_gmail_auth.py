@@ -146,6 +146,65 @@ def test_send_message_uses_gmail_api_thread_id_for_oauth(monkeypatch) -> None:
     assert parsed["References"] == "<root@msg> <parent@msg>"
 
 
+def test_send_message_resolves_api_thread_id_from_parent_message_for_numeric_imap_thread_id(monkeypatch) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class _FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self._payload
+
+    class _FakeSession:
+        def __init__(self, creds) -> None:
+            self.creds = creds
+
+        def post(self, url: str, *, json: dict, timeout: int):
+            calls.append(("post", {"url": url, "json": json, "timeout": timeout}))
+            return _FakeResponse({"id": "gmail-msg-1", "threadId": "api-thread-123"})
+
+        def get(self, url: str, *, timeout: int):
+            calls.append(("get", {"url": url, "timeout": timeout}))
+            if "messages?q=" in url:
+                return _FakeResponse({"messages": [{"id": "gmail-msg-1", "threadId": "api-thread-123"}]})
+            return _FakeResponse({"payload": {"headers": [{"name": "Message-ID", "value": "<actual@msg>"}]}})
+
+    monkeypatch.setattr("codex_mailbridge.emailer.AuthorizedSession", _FakeSession)
+
+    client = object.__new__(GmailClient)
+    client.config = SimpleNamespace(
+        gmail=SimpleNamespace(
+            auth_mode="oauth",
+            allowed_from="to@example.com",
+            address="bridge@example.com",
+            user_visible_from="user@example.com",
+        )
+    )
+    client.auth = SimpleNamespace(oauth_credentials=lambda: object())
+
+    message_id = client.send_message(
+        to_address="to@example.com",
+        subject="Re: subject",
+        markdown_body="hello",
+        in_reply_to="<parent@msg>",
+        references=["<root@msg>"],
+        from_address="bridge@example.com",
+        sender_address=None,
+        reply_to="bridge@example.com",
+        gmail_thread_id="1863067398965977352",
+    )
+
+    assert message_id == "<actual@msg>"
+    get_call = calls[0][1]
+    assert "rfc822msgid%3A%3Cparent%40msg%3E" in get_call["url"]
+    post_call = calls[1][1]
+    assert post_call["json"]["threadId"] == "api-thread-123"
+
+
 def test_send_message_falls_back_to_smtp_when_gmail_api_send_fails(monkeypatch) -> None:
     sent = {"count": 0}
 

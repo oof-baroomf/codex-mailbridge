@@ -16,7 +16,7 @@ import smtplib
 import ssl
 from typing import Iterable
 import tomllib
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2.credentials import Credentials
@@ -269,14 +269,46 @@ class GmailClient:
         finally:
             imap.logout()
 
-    def _send_via_gmail_api(self, msg: EmailMessage, gmail_thread_id: str | None) -> str:
+    def _resolve_gmail_api_thread_id(
+        self,
+        session: AuthorizedSession,
+        gmail_thread_id: str | None,
+        in_reply_to: str | None,
+        references: Iterable[str],
+    ) -> str | None:
+        if gmail_thread_id and not gmail_thread_id.isdigit():
+            return gmail_thread_id
+
+        lookup_ids = normalize_message_ids([in_reply_to, *references])
+        for message_id in lookup_ids:
+            query = quote(f"rfc822msgid:{message_id}", safe="")
+            response = session.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q={query}",
+                timeout=30,
+            )
+            response.raise_for_status()
+            messages = response.json().get("messages", [])
+            if messages:
+                thread_id = str(messages[0].get("threadId", "")).strip()
+                if thread_id:
+                    return thread_id
+        return None
+
+    def _send_via_gmail_api(
+        self,
+        msg: EmailMessage,
+        gmail_thread_id: str | None,
+        in_reply_to: str | None,
+        references: Iterable[str],
+    ) -> str:
         creds = self.auth.oauth_credentials()
         session = AuthorizedSession(creds)
         payload: dict[str, str] = {
             "raw": base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii"),
         }
-        if gmail_thread_id:
-            payload["threadId"] = gmail_thread_id
+        resolved_thread_id = self._resolve_gmail_api_thread_id(session, gmail_thread_id, in_reply_to, references)
+        if resolved_thread_id:
+            payload["threadId"] = resolved_thread_id
         response = session.post(
             "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
             json=payload,
@@ -339,7 +371,7 @@ class GmailClient:
 
         if self.config.gmail.auth_mode == "oauth" and getattr(self, "_gmail_api_send_enabled", True):
             try:
-                return self._send_via_gmail_api(msg, gmail_thread_id)
+                return self._send_via_gmail_api(msg, gmail_thread_id, in_reply_to, refs)
             except Exception as exc:
                 response = getattr(exc, "response", None)
                 response_text = ""

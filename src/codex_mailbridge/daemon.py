@@ -206,6 +206,13 @@ class MailBridgeDaemon:
         self.db.update_email_references(current_thread.agent_id, normalize_message_ids([*current_thread.email_references, email_id]))
         self.db.update_last_email_message_id(current_thread.agent_id, email_id)
 
+    def _send_submitted_turn_ack(self, thread: ThreadRecord, pending: PendingTurn) -> None:
+        self._send_turn_progress_reply(
+            thread,
+            pending,
+            "Queued your follow-up behind the current running turn. I'll send another update when Codex starts handling it.",
+        )
+
     def _send_thread_reply(self, thread: ThreadRecord, parent_message_id: str | None, body: str) -> None:
         current_thread = self._fresh_thread(thread)
         email_id = self.gmail.send_assistant_reply(
@@ -406,6 +413,23 @@ class MailBridgeDaemon:
                             pending_turn_id,
                             runner_pane_id=live_pending.runner_pane_id,
                             runner_log_path=live_pending.runner_log_path,
+                        )
+                        self._send_submitted_turn_ack(
+                            thread,
+                            PendingTurn(
+                                id=pending_turn_id,
+                                agent_id=thread.agent_id,
+                                gmail_message_id=msg.gmail_message_id,
+                                reply_to_message_id=msg.rfc_message_id,
+                                text_body=prompt_text,
+                                image_paths=image_paths,
+                                attachment_paths=attachment_paths,
+                                status="submitted",
+                                codex_turn_id=None,
+                                started_at=None,
+                                runner_pane_id=live_pending.runner_pane_id,
+                                runner_log_path=live_pending.runner_log_path,
+                            ),
                         )
                         return
                     self.db.delete_pending_turns([pending.id for pending in self.db.pending_turns_for_agent(thread.agent_id, statuses=("queued",))])

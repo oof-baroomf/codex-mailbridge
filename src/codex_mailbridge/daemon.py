@@ -19,7 +19,6 @@ NOTES_DIR = Path("/home/d/notes").resolve()
 DAEMON_TICK_SECONDS = 1.0
 SHELL_COMMAND_TIMEOUT_SECONDS = 120
 SHELL_COMMAND_OUTPUT_LIMIT = 20_000
-SUBMITTED_TURN_RETRY_SECONDS = 15
 
 
 class SubjectParseError(RuntimeError):
@@ -408,12 +407,6 @@ class MailBridgeDaemon:
                             image_paths=image_paths,
                             attachment_paths=attachment_paths,
                         )
-                        self.exec.send_prompt(live_pending.runner_pane_id, prompt_text)
-                        self.db.mark_turn_submitted(
-                            pending_turn_id,
-                            runner_pane_id=live_pending.runner_pane_id,
-                            runner_log_path=live_pending.runner_log_path,
-                        )
                         self._send_submitted_turn_ack(
                             thread,
                             PendingTurn(
@@ -424,11 +417,11 @@ class MailBridgeDaemon:
                                 text_body=prompt_text,
                                 image_paths=image_paths,
                                 attachment_paths=attachment_paths,
-                                status="submitted",
+                                status="queued",
                                 codex_turn_id=None,
                                 started_at=None,
-                                runner_pane_id=live_pending.runner_pane_id,
-                                runner_log_path=live_pending.runner_log_path,
+                                runner_pane_id=None,
+                                runner_log_path=None,
                             ),
                         )
                         return
@@ -494,10 +487,13 @@ class MailBridgeDaemon:
 
     def _start_queued_turns(self) -> None:
         for thread in self.db.tracked_threads():
-            active = self.db.pending_turns_for_agent(thread.agent_id, statuses=("running", "submitted"))
+            active = self.db.pending_turns_for_agent(thread.agent_id, statuses=("running",))
             if active:
                 continue
-            pending = self.db.next_queued_turn(thread.agent_id)
+            pending = next(
+                iter(self.db.pending_turns_for_agent(thread.agent_id, statuses=("queued", "submitted"))),
+                None,
+            )
             if pending is None:
                 continue
             try:
@@ -526,39 +522,8 @@ class MailBridgeDaemon:
         if not self.config.gmail.configured:
             return
         for thread in self.db.tracked_threads():
-            for pending in self.db.pending_turns_for_agent(thread.agent_id, statuses=("submitted",)):
-                self._sync_submitted_turn(thread, pending)
             for pending in self.db.pending_turns_for_agent(thread.agent_id, statuses=("running",)):
                 self._sync_pending_turn(thread, pending)
-
-    def _sync_submitted_turn(self, thread: ThreadRecord, pending: PendingTurn) -> None:
-        turn_id = self.exec.find_turn_id_since(pending.runner_log_path, pending.started_at or 0)
-        if turn_id:
-            self.db.mark_turn_running(
-                pending.id,
-                codex_turn_id=turn_id,
-                runner_pane_id=pending.runner_pane_id,
-                runner_log_path=pending.runner_log_path,
-            )
-            refreshed = next((item for item in self.db.pending_turns_for_agent(thread.agent_id, statuses=("running",)) if item.id == pending.id), None)
-            if refreshed is not None:
-                self._sync_pending_turn(thread, refreshed)
-            return
-        if pending.runner_pane_id and not self.exec.pane_running_codex(pending.runner_pane_id):
-            self._fail_pending_turn(thread, pending, "Codex exited before handling the injected email.")
-            return
-        if (
-            pending.runner_pane_id
-            and pending.started_at is not None
-            and time.time() - pending.started_at >= SUBMITTED_TURN_RETRY_SECONDS
-            and self.exec.pane_ready_for_input(pending.runner_pane_id)
-        ):
-            self.exec.send_prompt(pending.runner_pane_id, pending.text_body)
-            self.db.mark_turn_submitted(
-                pending.id,
-                runner_pane_id=pending.runner_pane_id,
-                runner_log_path=pending.runner_log_path,
-            )
 
     def _sync_pending_turn(self, thread: ThreadRecord, pending: PendingTurn) -> None:
         state = self.exec.read_turn_state(pending.runner_log_path, pending.codex_turn_id)

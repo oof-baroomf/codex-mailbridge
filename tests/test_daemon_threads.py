@@ -184,7 +184,7 @@ def test_handle_incoming_running_thread_injects_without_interrupting(monkeypatch
     )
 
     assert daemon.exec.interrupted == []
-    assert daemon.exec.sent_prompts == [("%2", "new request")]
+    assert daemon.exec.sent_prompts == []
     assert daemon.db.enqueued == [
         {
             "agent_id": "agent-1",
@@ -195,7 +195,7 @@ def test_handle_incoming_running_thread_injects_without_interrupting(monkeypatch
             "attachment_paths": [],
         }
     ]
-    assert daemon.db.submitted == [(4, "%2", "/tmp/2.jsonl")]
+    assert daemon.db.submitted == []
     assert daemon.db.updated_reply_to == []
     assert daemon.db.deleted == []
     assert daemon.gmail.calls == [
@@ -239,7 +239,7 @@ def test_handle_incoming_running_thread_executes_shell_lines_and_sends_trimmed_p
         )
     )
 
-    assert daemon.exec.sent_prompts == [("%2", "Please check this")]
+    assert daemon.exec.sent_prompts == []
     assert daemon.db.enqueued == [
         {
             "agent_id": "agent-1",
@@ -443,6 +443,20 @@ class _StartDB:
     def __init__(self) -> None:
         self.marked: list[tuple[int, str | None, str | None, str | None]] = []
         self.updated_thread_ids: list[tuple[str, str]] = []
+        self.pending = PendingTurn(
+            id=7,
+            agent_id="agent-1",
+            gmail_message_id="m1",
+            reply_to_message_id=None,
+            text_body="continue",
+            image_paths=["/tmp/one.png"],
+            attachment_paths=[],
+            status="queued",
+            codex_turn_id=None,
+            started_at=None,
+            runner_pane_id=None,
+            runner_log_path=None,
+        )
 
     def tracked_threads(self):
         return [
@@ -458,23 +472,7 @@ class _StartDB:
         ]
 
     def pending_turns_for_agent(self, agent_id: str, statuses=("queued", "running")):
-        return []
-
-    def next_queued_turn(self, agent_id: str) -> PendingTurn | None:
-        return PendingTurn(
-            id=7,
-            agent_id=agent_id,
-            gmail_message_id="m1",
-            reply_to_message_id=None,
-            text_body="continue",
-            image_paths=["/tmp/one.png"],
-            attachment_paths=[],
-            status="queued",
-            codex_turn_id=None,
-            started_at=None,
-            runner_pane_id=None,
-            runner_log_path=None,
-        )
+        return [self.pending] if self.pending.status in statuses else []
 
     def update_thread_codex_id(self, agent_id: str, codex_thread_id: str) -> None:
         self.updated_thread_ids.append((agent_id, codex_thread_id))
@@ -511,7 +509,6 @@ class _SyncDB:
         self.updated_email: list[tuple[str, str]] = []
         self.updated_references: list[tuple[str, list[str]]] = []
         self.updated_thread_ids: list[tuple[str, str]] = []
-        self.submitted: list[tuple[int, str | None, str | None]] = []
         self.thread = type(
             "Thread",
             (),
@@ -535,9 +532,6 @@ class _SyncDB:
 
     def mark_turn_finished(self, pending_turn_id: int, error: str | None = None) -> None:
         self.finished.append((pending_turn_id, error))
-
-    def mark_turn_submitted(self, pending_turn_id: int, *, runner_pane_id: str | None = None, runner_log_path: str | None = None) -> None:
-        self.submitted.append((pending_turn_id, runner_pane_id, runner_log_path))
 
     def turn_email_exists(self, turn_id: str, kind: str) -> bool:
         return any(recorded_turn_id == turn_id and recorded_kind == kind for recorded_turn_id, recorded_kind, _ in self.recorded)
@@ -676,64 +670,36 @@ def test_sync_pending_turn_marks_missing_codex_process_as_failure() -> None:
     ]
 
 
-def test_sync_submitted_turn_resends_idle_prompt_after_timeout(monkeypatch) -> None:
+def test_start_queued_turn_picks_submitted_turn_when_no_running_turn_exists() -> None:
     daemon = object.__new__(MailBridgeDaemon)
-    daemon.db = _SyncDB()
-    daemon.gmail = _FakeGmail()
+    daemon.db = _StartDB()
     daemon.exec = _FakeExec()
-    daemon.exec.live_panes.add("%1")
 
-    pending = PendingTurn(
-        id=5,
-        agent_id="agent-1",
-        gmail_message_id="m5",
-        reply_to_message_id="<reply@msg>",
-        text_body="continue with the next step",
-        image_paths=[],
-        attachment_paths=[],
-        status="submitted",
-        codex_turn_id=None,
-        started_at=100,
-        runner_pane_id="%1",
-        runner_log_path="/tmp/turn.jsonl",
-    )
+    def pending_turns_for_agent(agent_id: str, statuses=("queued", "running")):
+        if statuses == ("running",):
+            return []
+        return [
+            PendingTurn(
+                id=8,
+                agent_id=agent_id,
+                gmail_message_id="m8",
+                reply_to_message_id="<reply@msg>",
+                text_body="queued earlier",
+                image_paths=[],
+                attachment_paths=[],
+                status="submitted",
+                codex_turn_id=None,
+                started_at=100,
+                runner_pane_id="%1",
+                runner_log_path="/tmp/turn.jsonl",
+            )
+        ]
 
-    monkeypatch.setattr("codex_mailbridge.daemon.time.time", lambda: 116)
+    daemon.db.pending_turns_for_agent = pending_turns_for_agent
 
-    daemon._sync_submitted_turn(daemon.db.thread, pending)
+    daemon._start_queued_turns()
 
-    assert daemon.exec.sent_prompts == [("%1", "continue with the next step")]
-    assert daemon.db.submitted == [(5, "%1", "/tmp/turn.jsonl")]
-
-
-def test_sync_submitted_turn_does_not_resend_before_timeout(monkeypatch) -> None:
-    daemon = object.__new__(MailBridgeDaemon)
-    daemon.db = _SyncDB()
-    daemon.gmail = _FakeGmail()
-    daemon.exec = _FakeExec()
-    daemon.exec.live_panes.add("%1")
-
-    pending = PendingTurn(
-        id=5,
-        agent_id="agent-1",
-        gmail_message_id="m5",
-        reply_to_message_id="<reply@msg>",
-        text_body="continue with the next step",
-        image_paths=[],
-        attachment_paths=[],
-        status="submitted",
-        codex_turn_id=None,
-        started_at=100,
-        runner_pane_id="%1",
-        runner_log_path="/tmp/turn.jsonl",
-    )
-
-    monkeypatch.setattr("codex_mailbridge.daemon.time.time", lambda: 110)
-
-    daemon._sync_submitted_turn(daemon.db.thread, pending)
-
-    assert daemon.exec.sent_prompts == []
-    assert daemon.db.submitted == []
+    assert daemon.db.marked == [(8, "turn-123", "%1", "/tmp/turn.jsonl")]
 
 
 def test_handle_end_command_interrupts_running_turns_kills_session_and_acks() -> None:

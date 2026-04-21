@@ -166,6 +166,7 @@ class MailBridgeDaemon:
             markdown_body=body,
             parent_message_id=parent,
             references=current_thread.email_references,
+            gmail_thread_id=current_thread.gmail_thread_id,
         )
         self.db.record_turn_email(self._turn_key(pending), "assistant_reply", email_id)
         self.db.update_email_references(current_thread.agent_id, normalize_message_ids([*current_thread.email_references, email_id]))
@@ -179,6 +180,7 @@ class MailBridgeDaemon:
             markdown_body=body,
             parent_message_id=parent,
             references=current_thread.email_references,
+            gmail_thread_id=current_thread.gmail_thread_id,
         )
         self.db.record_turn_email(self._turn_key(pending), "assistant_progress", email_id)
         self.db.update_email_references(current_thread.agent_id, normalize_message_ids([*current_thread.email_references, email_id]))
@@ -191,6 +193,7 @@ class MailBridgeDaemon:
             markdown_body=body,
             parent_message_id=parent_message_id or current_thread.last_email_message_id,
             references=current_thread.email_references,
+            gmail_thread_id=current_thread.gmail_thread_id,
         )
         self.db.update_email_references(current_thread.agent_id, normalize_message_ids([*current_thread.email_references, email_id]))
         self.db.update_last_email_message_id(current_thread.agent_id, email_id)
@@ -555,4 +558,5 @@ class MailBridgeDaemon:
             markdown_body=f"Bridge error:\n\n{error_text}",
             parent_message_id=msg.rfc_message_id,
             references=msg.references,
+            gmail_thread_id=msg.gmail_thread_id,
         )

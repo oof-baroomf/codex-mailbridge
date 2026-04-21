@@ -16,8 +16,9 @@ import smtplib
 import ssl
 from typing import Iterable
 import tomllib
+from urllib.parse import urlencode
 
-from google.auth.transport.requests import Request
+from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 import markdown
@@ -267,6 +268,39 @@ class GmailClient:
         finally:
             imap.logout()
 
+    def _send_via_gmail_api(self, msg: EmailMessage, gmail_thread_id: str | None) -> str:
+        creds = self.auth.oauth_credentials()
+        session = AuthorizedSession(creds)
+        payload: dict[str, str] = {
+            "raw": base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii"),
+        }
+        if gmail_thread_id:
+            payload["threadId"] = gmail_thread_id
+        response = session.post(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        gmail_message_id = str(data["id"])
+        params = urlencode([("format", "metadata"), ("metadataHeaders", "Message-ID")])
+        metadata = session.get(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{gmail_message_id}?{params}",
+            timeout=30,
+        )
+        metadata.raise_for_status()
+        headers = metadata.json().get("payload", {}).get("headers", [])
+        actual_message_id = next(
+            (
+                str(header.get("value", "")).strip()
+                for header in headers
+                if str(header.get("name", "")).lower() == "message-id" and str(header.get("value", "")).strip()
+            ),
+            "",
+        )
+        return actual_message_id or str(msg["Message-ID"])
+
     def send_message(
         self,
         *,
@@ -278,6 +312,7 @@ class GmailClient:
         from_address: str,
         sender_address: str | None,
         reply_to: str | None,
+        gmail_thread_id: str | None = None,
     ) -> str:
         msg = EmailMessage()
         msg["To"] = to_address
@@ -301,6 +336,12 @@ class GmailClient:
         msg.set_content(markdown_body)
         msg.add_alternative(html_body, subtype="html")
 
+        if self.config.gmail.auth_mode == "oauth":
+            try:
+                return self._send_via_gmail_api(msg, gmail_thread_id)
+            except Exception:
+                LOG.exception("Gmail API send failed; falling back to SMTP")
+
         smtp = smtplib.SMTP(self.config.gmail.smtp_host, self.config.gmail.smtp_port, timeout=30)
         try:
             smtp.ehlo()
@@ -319,6 +360,7 @@ class GmailClient:
         markdown_body: str,
         parent_message_id: str | None,
         references: Iterable[str],
+        gmail_thread_id: str | None = None,
     ) -> str:
         return self.send_message(
             to_address=self.config.gmail.allowed_from,
@@ -329,6 +371,7 @@ class GmailClient:
             from_address=self.config.gmail.address,
             sender_address=None,
             reply_to=self.config.gmail.address,
+            gmail_thread_id=gmail_thread_id,
         )
 
     def send_cli_user_mirror(
@@ -338,6 +381,7 @@ class GmailClient:
         markdown_body: str,
         parent_message_id: str | None,
         references: Iterable[str],
+        gmail_thread_id: str | None = None,
     ) -> str:
         return self.send_message(
             to_address=self.config.gmail.allowed_from,
@@ -348,6 +392,7 @@ class GmailClient:
             from_address=self.config.gmail.user_visible_from,
             sender_address=self.config.gmail.address,
             reply_to=self.config.gmail.address,
+            gmail_thread_id=gmail_thread_id,
         )
 
 

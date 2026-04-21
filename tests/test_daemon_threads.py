@@ -228,6 +228,7 @@ def test_handle_incoming_running_thread_executes_shell_lines_and_sends_trimmed_p
             "markdown_body": "Shell command output from `/tmp/work`:\n\n```text\n$ pwd\n\n[stdout]\nok\n\n[exit 0]\n```\n\n```text\n$ git status --short\n\n[stdout]\nok\n\n[exit 0]\n```",
             "parent_message_id": "<reply@msg>",
             "references": ["<root@msg>", "<last@msg>", "<reply@msg>"],
+            "gmail_thread_id": "g1",
         }
     ]
 
@@ -267,6 +268,7 @@ def test_handle_incoming_command_only_reply_skips_codex(monkeypatch) -> None:
             "markdown_body": "Shell command output from `/tmp/work`:\n\n```text\n$ pwd\n\n[stdout]\n/tmp/work\n\n[exit 0]\n```\n\n```text\n$ ls\n\n[stdout]\n/tmp/work\n\n[exit 0]\n```",
             "parent_message_id": "<reply@msg>",
             "references": ["<root@msg>", "<last@msg>", "<reply@msg>"],
+            "gmail_thread_id": "g1",
         }
     ]
 
@@ -538,6 +540,7 @@ def test_sync_pending_turn_completed_without_final_message_uses_error_reply() ->
             "markdown_body": "Codex error:\n\nSelected model is at capacity. Please try a different model.",
             "parent_message_id": "<reply@msg>",
             "references": ["<root@msg>", "<last@msg>"],
+            "gmail_thread_id": "g1",
         }
     ]
 
@@ -561,6 +564,7 @@ def test_sync_pending_turn_emails_failure() -> None:
             "markdown_body": "Codex error:\n\nboom",
             "parent_message_id": "<reply@msg>",
             "references": ["<root@msg>", "<last@msg>"],
+            "gmail_thread_id": "g1",
         }
     ]
 
@@ -597,6 +601,7 @@ def test_sync_pending_turn_marks_missing_codex_process_as_failure() -> None:
             "markdown_body": "Codex error:\n\nCodex exited without a final status.",
             "parent_message_id": "<reply@msg>",
             "references": ["<root@msg>", "<last@msg>"],
+            "gmail_thread_id": "g1",
         }
     ]
 
@@ -679,5 +684,6 @@ def test_handle_end_command_interrupts_running_turns_kills_session_and_acks() ->
             "markdown_body": "Ended. The tmux session was stopped. Reply again on this thread to resume the same Codex session.",
             "parent_message_id": "<reply@msg>",
             "references": ["<root@msg>", "<last@msg>"],
+            "gmail_thread_id": "g1",
         }
     ]

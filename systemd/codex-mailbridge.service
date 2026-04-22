@@ -9,6 +9,7 @@ User=d
 WorkingDirectory=/home/d/coding/codex-mailbridge
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/uv run --directory /home/d/coding/codex-mailbridge codex-mailbridge --config /home/d/.config/codex-mailbridge/config.toml
+KillMode=process
 Restart=always
 RestartSec=5
 SuccessExitStatus=143 SIGTERM

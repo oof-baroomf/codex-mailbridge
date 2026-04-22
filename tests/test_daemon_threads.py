@@ -673,6 +673,23 @@ def test_sync_pending_turn_marks_missing_codex_process_as_failure() -> None:
     ]
 
 
+def test_sync_pending_turn_uses_last_agent_text_when_process_exits_without_final_status() -> None:
+    daemon = object.__new__(MailBridgeDaemon)
+    daemon.db = _SyncDB()
+    daemon.gmail = _FakeGmail()
+    daemon.exec = _FakeExec()
+    daemon.exec.live_panes.clear()
+    daemon.exec.state = ExecTurnState(
+        first_agent_text="working",
+        last_agent_text="final draft",
+    )
+
+    daemon._sync_pending_turn(daemon.db.thread, _pending())
+
+    assert daemon.db.finished == [(1, None)]
+    assert [call["markdown_body"] for call in daemon.gmail.calls] == ["working", "final draft"]
+
+
 def test_start_queued_turn_picks_submitted_turn_when_no_running_turn_exists() -> None:
     daemon = object.__new__(MailBridgeDaemon)
     daemon.db = _SyncDB()

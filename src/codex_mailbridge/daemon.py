@@ -222,6 +222,11 @@ class MailBridgeDaemon:
         if not self.db.turn_email_exists(self._turn_key(pending), "assistant_reply"):
             self._send_turn_reply(thread, pending, _format_turn_failure(error_text))
 
+    def _complete_pending_turn_with_reply(self, thread: ThreadRecord, pending: PendingTurn, body: str) -> None:
+        self.db.mark_turn_finished(pending.id, None)
+        if not self.db.turn_email_exists(self._turn_key(pending), "assistant_reply"):
+            self._send_turn_reply(thread, pending, body)
+
     def _submit_pending_turn(self, thread: ThreadRecord, pending: PendingTurn) -> None:
         started = self.exec.submit_prompt(
             agent_id=thread.agent_id,
@@ -526,9 +531,7 @@ class MailBridgeDaemon:
 
         if state.turn_completed:
             if state.last_agent_text:
-                self.db.mark_turn_finished(pending.id, None)
-                if not self.db.turn_email_exists(turn_key, "assistant_reply"):
-                    self._send_turn_reply(thread, pending, state.last_agent_text)
+                self._complete_pending_turn_with_reply(thread, pending, state.last_agent_text)
             elif state.errors:
                 error_text = state.failure_text()
                 self.db.mark_turn_finished(pending.id, error_text)
@@ -545,20 +548,21 @@ class MailBridgeDaemon:
                 self._send_turn_reply(thread, pending, _format_turn_failure(error_text))
             return
 
+        if state.exit_code == 0:
+            if state.last_agent_text:
+                self._complete_pending_turn_with_reply(thread, pending, state.last_agent_text)
+                return
+            self._fail_pending_turn(thread, pending, "Codex exited without a final response.")
+            return
+
         if pending.runner_pane_id and not self.exec.pane_running_codex(pending.runner_pane_id):
+            if state.last_agent_text:
+                self._complete_pending_turn_with_reply(thread, pending, state.last_agent_text)
+                return
             error_text = "Codex exited without a final status."
             self.db.mark_turn_finished(pending.id, error_text)
             if not self.db.turn_email_exists(turn_key, "assistant_reply"):
                 self._send_turn_reply(thread, pending, _format_turn_failure(error_text))
-            return
-
-        if state.exit_code == 0:
-            if state.last_agent_text:
-                self.db.mark_turn_finished(pending.id, None)
-                if not self.db.turn_email_exists(turn_key, "assistant_reply"):
-                    self._send_turn_reply(thread, pending, state.last_agent_text)
-                return
-            self._fail_pending_turn(thread, pending, "Codex exited without a final response.")
             return
 
         if pending.runner_pane_id and not self.exec.pane_exists(pending.runner_pane_id):

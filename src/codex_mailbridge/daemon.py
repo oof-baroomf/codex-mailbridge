@@ -446,7 +446,7 @@ class MailBridgeDaemon:
         self._send_thread_reply(
             thread,
             reply_to_message_id,
-            "Ended. The tmux session was stopped. Reply again on this thread to resume the same Codex session.",
+            "Ended because your email body was exactly `end`. The tmux session was stopped. Reply again on this thread to resume the same Codex session.",
         )
 
     def _create_thread(

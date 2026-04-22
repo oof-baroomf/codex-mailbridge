@@ -716,7 +716,7 @@ def test_handle_end_command_interrupts_running_turns_kills_session_and_acks() ->
     assert daemon.gmail.calls == [
         {
             "subject": "Re: subject",
-            "markdown_body": "Ended. The tmux session was stopped. Reply again on this thread to resume the same Codex session.",
+            "markdown_body": "Ended because your email body was exactly `end`. The tmux session was stopped. Reply again on this thread to resume the same Codex session.",
             "parent_message_id": "<reply@msg>",
             "references": ["<root@msg>", "<last@msg>"],
             "gmail_thread_id": "g1",

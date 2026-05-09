@@ -169,7 +169,7 @@ def test_split_reply_commands_separates_shell_lines() -> None:
     assert shell_commands == ["pwd", "ls -1"]
 
 
-def test_handle_incoming_running_thread_injects_without_interrupting(monkeypatch) -> None:
+def test_handle_incoming_running_thread_queues_without_interrupting(monkeypatch) -> None:
     from codex_mailbridge.daemon import IncomingMail
 
     daemon = object.__new__(MailBridgeDaemon)
@@ -204,22 +204,13 @@ def test_handle_incoming_running_thread_injects_without_interrupting(monkeypatch
             "attachment_paths": [],
         }
     ]
-    assert daemon.db.submitted == [(4, "%1", "/tmp/turn.jsonl")]
+    assert daemon.db.submitted == []
     assert daemon.db.updated_reply_to == []
     assert daemon.db.deleted == []
     assert daemon.gmail.calls == []
     assert daemon.db.recorded == []
     assert daemon.db.updated_references == [("agent-1", ["<root@msg>", "<last@msg>", "<reply@msg>"])]
-    assert daemon.exec.started == [
-        {
-            "agent_id": "agent-1",
-            "workspace": Path("/tmp/work"),
-            "prompt": "new request",
-            "image_paths": [],
-            "resume_session_id": "session-123",
-            "wait_for_turn_id": False,
-        }
-    ]
+    assert daemon.exec.started == []
 
 
 def test_handle_incoming_running_thread_executes_shell_lines_and_sends_trimmed_prompt(monkeypatch) -> None:
@@ -266,7 +257,7 @@ def test_handle_incoming_running_thread_executes_shell_lines_and_sends_trimmed_p
             "gmail_thread_id": "g1",
         }
     ]
-    assert daemon.db.submitted == [(4, "%1", "/tmp/turn.jsonl")]
+    assert daemon.db.submitted == []
 
 
 def test_handle_incoming_command_only_reply_skips_codex(monkeypatch) -> None:
@@ -690,7 +681,7 @@ def test_sync_pending_turn_uses_last_agent_text_when_process_exits_without_final
     assert [call["markdown_body"] for call in daemon.gmail.calls] == ["working", "final draft"]
 
 
-def test_start_queued_turn_picks_submitted_turn_when_no_running_turn_exists() -> None:
+def test_submitted_turn_times_out_when_codex_never_accepts_prompt() -> None:
     daemon = object.__new__(MailBridgeDaemon)
     daemon.db = _SyncDB()
     daemon.gmail = _FakeGmail()
@@ -714,7 +705,7 @@ def test_start_queued_turn_picks_submitted_turn_when_no_running_turn_exists() ->
 
     daemon._sync_submitted_turn(daemon.db.thread, pending)
 
-    assert daemon.db.finished == []
+    assert daemon.db.finished == [(8, "Codex did not accept the injected email within 90 seconds.")]
     assert daemon.exec.sent_prompts == []
 
 

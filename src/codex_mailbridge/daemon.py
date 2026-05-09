@@ -9,7 +9,7 @@ import subprocess
 import time
 
 from .codex_exec import CodexExecManager
-from .config import Config
+from .config import Config, ConfigError
 from .db import PendingTurn, StateDB, ThreadRecord
 from .emailer import GmailClient, IncomingMail, email_addresses_match, normalize_message_ids, save_attachments
 
@@ -19,6 +19,7 @@ NOTES_DIR = Path("/home/d/notes").resolve()
 DAEMON_TICK_SECONDS = 1.0
 SHELL_COMMAND_TIMEOUT_SECONDS = 120
 SHELL_COMMAND_OUTPUT_LIMIT = 20_000
+SUBMITTED_TURN_TIMEOUT_SECONDS = 90
 
 
 class SubjectParseError(RuntimeError):
@@ -134,11 +135,12 @@ def _session_id_for_thread(thread: ThreadRecord) -> str | None:
 class MailBridgeDaemon:
     def __init__(self, config: Config) -> None:
         self.config = config
+        if not config.gmail.configured:
+            raise ConfigError(f"Gmail auth is incomplete for auth_mode={config.gmail.auth_mode!r}")
         configure_logging(config.runtime.log_dir)
         self.db = StateDB(config.runtime.state_dir / "state.sqlite3")
         self.gmail = GmailClient(config)
         self.exec = CodexExecManager(config)
-        self.auth_warning_logged = False
 
     def run(self) -> None:
         LOG.info("codex-mailbridge started")
@@ -244,6 +246,9 @@ class MailBridgeDaemon:
             runner_log_path=started.log_path,
         )
 
+    def _agent_has_active_turn(self, agent_id: str) -> bool:
+        return bool(self.db.pending_turns_for_agent(agent_id, statuses=("submitted", "running")))
+
     def _run_shell_command(self, workspace: Path, command: str) -> tuple[str, int | None]:
         try:
             proc = subprocess.run(
@@ -326,11 +331,6 @@ class MailBridgeDaemon:
         self._send_thread_reply(thread, parent_message_id, "\n".join(blocks))
 
     def _poll_inbox(self) -> None:
-        if not self.config.gmail.configured:
-            if not self.auth_warning_logged:
-                LOG.warning("Gmail auth is not configured yet; skipping mail polling")
-                self.auth_warning_logged = True
-            return
         try:
             messages = self.gmail.fetch_incoming()
         except Exception:
@@ -338,6 +338,8 @@ class MailBridgeDaemon:
             return
         for msg in messages:
             if not email_addresses_match(msg.from_address, self.config.gmail.allowed_from):
+                LOG.warning("Ignoring mail from unauthorized sender %s", msg.from_address)
+                self.gmail.mark_seen(msg.uid)
                 continue
             if self.db.message_processed(msg.gmail_message_id):
                 self.gmail.mark_seen(msg.uid)
@@ -357,6 +359,7 @@ class MailBridgeDaemon:
     def _handle_incoming(self, msg: IncomingMail) -> None:
         body_text = _extract_latest_reply_text(msg.body_text)
         prompt_text, shell_commands = _split_reply_commands(body_text)
+        has_payload = bool(prompt_text or shell_commands or msg.attachments)
         attachment_paths: list[str] | None = None
         image_paths: list[str] | None = None
         shell_commands_sent = False
@@ -367,28 +370,30 @@ class MailBridgeDaemon:
                 self.db.update_thread_gmail_id(thread.agent_id, msg.gmail_thread_id)
                 thread = self._fresh_thread(thread)
         if thread is None:
+            if not has_payload:
+                LOG.info("Ignoring empty mail with no existing thread: %s", msg.subject)
+                return
             raw_path, agent_id = parse_subject(msg.subject)
             workspace = normalize_workspace_path(raw_path)
-            if prompt_text or shell_commands:
-                existing_thread = self.db.get_thread_by_agent(agent_id)
-                if existing_thread is not None:
-                    existing_workspace = Path(existing_thread.workspace_path).resolve()
-                    if workspace != existing_workspace:
-                        raise SubjectParseError(
-                            f"Agent id '{agent_id}' has already been used for {existing_thread.workspace_path}"
-                        )
-                    self.db.update_thread_gmail_id(existing_thread.agent_id, msg.gmail_thread_id)
-                    thread = self.db.get_thread_by_agent(existing_thread.agent_id)
-                    assert thread is not None
-                else:
-                    thread = self._create_thread(
-                        agent_id=agent_id,
-                        workspace=workspace,
-                        gmail_thread_id=msg.gmail_thread_id,
-                        canonical_subject=msg.subject,
-                        initial_message_id=msg.rfc_message_id,
-                        initial_references=normalize_message_ids([*msg.references, msg.rfc_message_id]),
+            existing_thread = self.db.get_thread_by_agent(agent_id)
+            if existing_thread is not None:
+                existing_workspace = Path(existing_thread.workspace_path).resolve()
+                if workspace != existing_workspace:
+                    raise SubjectParseError(
+                        f"Agent id '{agent_id}' has already been used for {existing_thread.workspace_path}"
                     )
+                self.db.update_thread_gmail_id(existing_thread.agent_id, msg.gmail_thread_id)
+                thread = self.db.get_thread_by_agent(existing_thread.agent_id)
+                assert thread is not None
+            else:
+                thread = self._create_thread(
+                    agent_id=agent_id,
+                    workspace=workspace,
+                    gmail_thread_id=msg.gmail_thread_id,
+                    canonical_subject=msg.subject,
+                    initial_message_id=msg.rfc_message_id,
+                    initial_references=normalize_message_ids([*msg.references, msg.rfc_message_id]),
+                )
         if thread is not None:
             merged_references = normalize_message_ids([*thread.email_references, *msg.references, msg.rfc_message_id])
             if merged_references != thread.email_references:
@@ -407,10 +412,15 @@ class MailBridgeDaemon:
                     return
 
         if attachment_paths is None or image_paths is None:
+            if thread is None:
+                raise RuntimeError("Could not resolve or create a mailbridge thread.")
             attachment_paths, image_paths = save_attachments(workspace, msg.attachments)
         if shell_commands and thread is not None and not shell_commands_sent:
             self._send_shell_command_reply(thread, msg.rfc_message_id, workspace, shell_commands)
         if not prompt_text:
+            if attachment_paths and thread is not None and not shell_commands:
+                saved = "\n".join(f"- `{path}`" for path in attachment_paths)
+                self._send_thread_reply(thread, msg.rfc_message_id, f"Saved attachments:\n\n{saved}")
             return
         assert thread is not None
         pending_turn_id = self.db.enqueue_turn(
@@ -435,6 +445,9 @@ class MailBridgeDaemon:
             runner_pane_id=None,
             runner_log_path=None,
         )
+        if self._agent_has_active_turn(thread.agent_id):
+            LOG.info("Queued turn %s for %s because another turn is active", pending.id, thread.agent_id)
+            return
         self._submit_pending_turn(thread, pending)
 
     def _handle_end_command(self, thread: ThreadRecord, reply_to_message_id: str | None) -> None:
@@ -479,12 +492,17 @@ class MailBridgeDaemon:
 
     def _start_queued_turns(self) -> None:
         for thread in self.db.tracked_threads():
-            for pending in self.db.pending_turns_for_agent(thread.agent_id, statuses=("queued",)):
-                try:
-                    self._submit_pending_turn(thread, pending)
-                except Exception as exc:
-                    LOG.exception("Failed to submit queued turn for %s", thread.agent_id)
-                    self._fail_pending_turn(thread, pending, str(exc))
+            if self._agent_has_active_turn(thread.agent_id):
+                continue
+            queued_turns = self.db.pending_turns_for_agent(thread.agent_id, statuses=("queued",))
+            if not queued_turns:
+                continue
+            pending = queued_turns[0]
+            try:
+                self._submit_pending_turn(thread, pending)
+            except Exception as exc:
+                LOG.exception("Failed to submit queued turn for %s", thread.agent_id)
+                self._fail_pending_turn(thread, pending, str(exc))
 
     def _sync_running_turns(self) -> None:
         if not self.config.gmail.configured:
@@ -514,6 +532,15 @@ class MailBridgeDaemon:
             )
             if refreshed is not None:
                 self._sync_pending_turn(thread, refreshed)
+            return
+        if pending.started_at and time.time() - pending.started_at > SUBMITTED_TURN_TIMEOUT_SECONDS:
+            if pending.runner_pane_id:
+                self.exec.interrupt_turn(pending.runner_pane_id)
+            self._fail_pending_turn(
+                thread,
+                pending,
+                f"Codex did not accept the injected email within {SUBMITTED_TURN_TIMEOUT_SECONDS} seconds.",
+            )
             return
         if pending.runner_pane_id and not self.exec.pane_running_codex(pending.runner_pane_id):
             self._fail_pending_turn(thread, pending, "Codex exited before handling the injected email.")

@@ -10,8 +10,10 @@ Local daemon that:
 - queues only the new email reply text into Codex without adding extra instructions
 - treats reply lines starting with `!` as `bash -lc` commands in the thread workspace and emails their output back
 - skips Codex entirely when a reply only contains `!` commands and blank lines
-- interrupts the current turn if a newer email arrives for the same thread
+- queues new replies behind the current turn for that agent instead of injecting into a busy TUI
+- fails a submitted turn if Codex does not accept the injected email within 90 seconds
 - emails the first assistant update immediately, then the last assistant reply when the turn finishes
 - emails Codex failures instead of silently stalling
+- raises on broken IMAP fetches, Gmail API send failures, tmux send failures, and malformed Codex session logs instead of using silent fallbacks
 
 The runtime config lives at `/home/d/.config/codex-mailbridge/config.toml`.

@@ -34,6 +34,10 @@ _GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
 _MESSAGE_ID_PATTERN = re.compile(r"<[^<>]+>")
 
 
+class MailProtocolError(RuntimeError):
+    pass
+
+
 class _HTMLStripper(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -221,8 +225,20 @@ class GmailClient:
             self.config.gmail.imap_port,
             timeout=IMAP_TIMEOUT_SECONDS,
         )
-        self.auth.imap_login(imap)
-        imap.select("INBOX")
+        try:
+            self.auth.imap_login(imap)
+            status, data = imap.select("INBOX")
+        except Exception:
+            try:
+                imap.logout()
+            except Exception:
+                LOG.warning("Failed to close IMAP connection after login/select failure", exc_info=True)
+            raise
+        if status != "OK":
+            try:
+                imap.logout()
+            finally:
+                raise MailProtocolError(f"IMAP SELECT INBOX failed: {data!r}")
         return imap
 
     def fetch_incoming(self) -> list[IncomingMail]:
@@ -230,13 +246,13 @@ class GmailClient:
         try:
             status, data = imap.uid("SEARCH", None, "UNSEEN", "FROM", self.config.gmail.allowed_from)
             if status != "OK":
-                return []
+                raise MailProtocolError(f"IMAP SEARCH failed: {data!r}")
             uids = [uid.decode("ascii") for uid in data[0].split() if uid]
             messages: list[IncomingMail] = []
             for uid in uids:
                 status, fetch_data = imap.uid("FETCH", uid, "(X-GM-MSGID X-GM-THRID BODY.PEEK[])")
                 if status != "OK" or not fetch_data or not isinstance(fetch_data[0], tuple):
-                    continue
+                    raise MailProtocolError(f"IMAP FETCH failed for uid {uid}: status={status!r} data={fetch_data!r}")
                 meta, raw_message = fetch_data[0]
                 gmail_message_id, gmail_thread_id = _parse_gmail_fetch_metadata(meta)
                 msg = email.message_from_bytes(raw_message, policy=policy.default)
@@ -257,10 +273,7 @@ class GmailClient:
                 )
             return messages
         finally:
-            try:
-                imap.logout()
-            except Exception:
-                LOG.exception("Failed to close IMAP cleanly")
+            imap.logout()
 
     def mark_seen(self, uid: str) -> None:
         imap = self._open_imap()
@@ -369,22 +382,8 @@ class GmailClient:
         msg.set_content(markdown_body)
         msg.add_alternative(html_body, subtype="html")
 
-        if self.config.gmail.auth_mode == "oauth" and getattr(self, "_gmail_api_send_enabled", True):
-            try:
-                return self._send_via_gmail_api(msg, gmail_thread_id, in_reply_to, refs)
-            except Exception as exc:
-                response = getattr(exc, "response", None)
-                response_text = ""
-                if response is not None:
-                    try:
-                        response_text = response.text
-                    except Exception:
-                        response_text = ""
-                if getattr(response, "status_code", None) == 403 and "SERVICE_DISABLED" in response_text:
-                    self._gmail_api_send_enabled = False
-                    LOG.warning("Gmail API send is disabled for this OAuth project; using SMTP fallback")
-                else:
-                    LOG.exception("Gmail API send failed; falling back to SMTP")
+        if self.config.gmail.auth_mode == "oauth":
+            return self._send_via_gmail_api(msg, gmail_thread_id, in_reply_to, refs)
 
         smtp = smtplib.SMTP(self.config.gmail.smtp_host, self.config.gmail.smtp_port, timeout=30)
         try:

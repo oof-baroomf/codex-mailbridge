@@ -4,6 +4,8 @@ from email import policy
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from codex_mailbridge.emailer import (
     GmailClient,
     _xoauth2,
@@ -48,8 +50,9 @@ def test_open_imap_sets_timeout(monkeypatch) -> None:
     calls: list[tuple[str, int, int | None]] = []
 
     class _FakeImap:
-        def select(self, mailbox: str) -> None:
+        def select(self, mailbox: str):
             assert mailbox == "INBOX"
+            return "OK", [b""]
 
     def _fake_imap(host: str, port: int, *, timeout: int | None = None):
         calls.append((host, port, timeout))
@@ -205,7 +208,7 @@ def test_send_message_resolves_api_thread_id_from_parent_message_for_numeric_ima
     assert post_call["json"]["threadId"] == "api-thread-123"
 
 
-def test_send_message_falls_back_to_smtp_when_gmail_api_send_fails(monkeypatch) -> None:
+def test_send_message_raises_when_gmail_api_send_fails(monkeypatch) -> None:
     sent = {"count": 0}
 
     class _FakeSMTP:
@@ -243,19 +246,19 @@ def test_send_message_falls_back_to_smtp_when_gmail_api_send_fails(monkeypatch) 
         oauth_credentials=lambda: object(),
         smtp_login=lambda smtp: None,
     )
-    client._send_via_gmail_api = lambda msg, gmail_thread_id: (_ for _ in ()).throw(RuntimeError("boom"))
+    client._send_via_gmail_api = lambda msg, gmail_thread_id, in_reply_to, refs: (_ for _ in ()).throw(RuntimeError("boom"))
 
-    message_id = client.send_message(
-        to_address="to@example.com",
-        subject="Re: subject",
-        markdown_body="hello",
-        in_reply_to="<parent@msg>",
-        references=["<root@msg>"],
-        from_address="bridge@example.com",
-        sender_address=None,
-        reply_to="bridge@example.com",
-        gmail_thread_id="thread-123",
-    )
+    with pytest.raises(RuntimeError, match="boom"):
+        client.send_message(
+            to_address="to@example.com",
+            subject="Re: subject",
+            markdown_body="hello",
+            in_reply_to="<parent@msg>",
+            references=["<root@msg>"],
+            from_address="bridge@example.com",
+            sender_address=None,
+            reply_to="bridge@example.com",
+            gmail_thread_id="thread-123",
+        )
 
-    assert sent["count"] == 1
-    assert message_id.startswith("<")
+    assert sent["count"] == 0

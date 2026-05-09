@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
-import logging
 from pathlib import Path
 import re
 import shlex
@@ -12,9 +11,6 @@ import subprocess
 import time
 
 from .config import Config
-
-
-LOG = logging.getLogger(__name__)
 DEFAULT_CODEX_BIN = "/home/d/.bun/bin/codex"
 TMUX_SESSION_PREFIX = "codex-mailbridge"
 CODEX_SESSION_DIR = Path.home() / ".codex" / "sessions"
@@ -62,6 +58,34 @@ class ExecTurnState:
         if self.exit_code is not None:
             return f"Codex exited with status {self.exit_code}."
         return "Codex turn failed."
+
+
+class CodexSessionLogError(RuntimeError):
+    pass
+
+
+def _json_event(raw_line: str, *, source: Path) -> dict:
+    try:
+        event = json.loads(raw_line)
+    except json.JSONDecodeError as exc:
+        raise CodexSessionLogError(f"Invalid JSON in Codex session log {source}: {raw_line[:200]!r}") from exc
+    if not isinstance(event, dict):
+        raise CodexSessionLogError(f"Invalid Codex session event in {source}: expected object")
+    return event
+
+
+def _run_checked(argv: list[str], *, capture_output: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        argv,
+        capture_output=capture_output,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        detail = f": {stderr}" if stderr else ""
+        raise RuntimeError(f"Command failed ({result.returncode}): {shlex.join(argv)}{detail}")
+    return result
 
 
 class CodexExecManager:
@@ -184,7 +208,7 @@ class CodexExecManager:
         assert session_path is not None
 
         if not self._session_has_attached_clients(session_name):
-            subprocess.run(["tmux", "select-window", "-t", self._session_target(agent_id)], check=False)
+            _run_checked(["tmux", "select-window", "-t", self._session_target(agent_id)])
         return StartedTurn(
             pane_id=pane_id,
             log_path=str(session_path),
@@ -193,7 +217,7 @@ class CodexExecManager:
         )
 
     def interrupt_turn(self, pane_id: str) -> None:
-        subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-c"], check=False)
+        _run_checked(["tmux", "send-keys", "-t", pane_id, "C-c"])
 
     def send_prompt(self, pane_id: str, prompt: str) -> None:
         self._send_prompt(pane_id, prompt)
@@ -206,7 +230,14 @@ class CodexExecManager:
 
     def kill_agent_session(self, agent_id: str) -> None:
         session_name = self._session_name(agent_id)
-        subprocess.run(["tmux", "kill-session", "-t", session_name], check=False)
+        result = subprocess.run(
+            ["tmux", "kill-session", "-t", session_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0 and "can't find session" not in (result.stderr or "").lower():
+            raise RuntimeError(f"Failed to kill tmux session {session_name}: {result.stderr.strip()}")
 
     def pane_exists(self, pane_id: str) -> bool:
         result = subprocess.run(
@@ -244,9 +275,11 @@ class CodexExecManager:
             if not line:
                 continue
             try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+                event = _json_event(line, source=path)
+            except CodexSessionLogError as exc:
+                state.errors.append(str(exc))
+                state.exit_code = 1
+                return state
             if event.get("type") != "event_msg":
                 continue
             payload = event.get("payload", {})
@@ -283,10 +316,11 @@ class CodexExecManager:
             if not line:
                 continue
             try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                LOG.warning("Ignoring non-JSON Codex session line: %s", line)
-                continue
+                event = _json_event(line, source=path)
+            except CodexSessionLogError as exc:
+                state.errors.append(str(exc))
+                state.exit_code = 1
+                return state
 
             event_type = event.get("type")
             if event_type == "session_meta":
@@ -407,7 +441,7 @@ class CodexExecManager:
         while time.monotonic() < deadline:
             pane_text = self._capture_pane(pane_id)
             if "Press enter to continue" in pane_text:
-                subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-m"], check=False)
+                _run_checked(["tmux", "send-keys", "-t", pane_id, "C-m"])
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
             if self._pane_text_indicates_ready(pane_text):
@@ -457,8 +491,10 @@ class CodexExecManager:
                     continue
                 try:
                     event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                except json.JSONDecodeError as exc:
+                    raise CodexSessionLogError(
+                        f"Invalid JSON in Codex session log {session_path}: {line[:200]!r}"
+                    ) from exc
                 if event.get("type") != "event_msg":
                     continue
                 payload = event.get("payload", {})
@@ -474,10 +510,10 @@ class CodexExecManager:
         lines = prompt.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         for index, line in enumerate(lines):
             if line:
-                subprocess.run(["tmux", "send-keys", "-l", "-t", pane_id, "--", line], check=False)
+                _run_checked(["tmux", "send-keys", "-l", "-t", pane_id, "--", line])
                 time.sleep(KEYSTROKE_DELAY_SECONDS)
             if index < len(lines) - 1:
-                subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-j"], check=False)
+                _run_checked(["tmux", "send-keys", "-t", pane_id, "C-j"])
                 time.sleep(KEYSTROKE_DELAY_SECONDS)
         time.sleep(SUBMIT_DELAY_SECONDS)
         self._submit_prompt(pane_id)
@@ -503,9 +539,9 @@ class CodexExecManager:
         if not first_line:
             return None, None
         try:
-            event = json.loads(first_line)
-        except json.JSONDecodeError:
-            return None, None
+            event = _json_event(first_line, source=path)
+        except CodexSessionLogError:
+            raise
         if event.get("type") != "session_meta":
             return None, None
         payload = event.get("payload", {})
@@ -547,7 +583,7 @@ class CodexExecManager:
         return "esc to interrupt" in lowered or "working (" in lowered or "working…" in lowered
 
     def _submit_prompt(self, pane_id: str) -> None:
-        subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-m"], check=False)
+        _run_checked(["tmux", "send-keys", "-t", pane_id, "C-m"])
 
     def _session_has_attached_clients(self, session_name: str) -> bool:
         result = subprocess.run(
